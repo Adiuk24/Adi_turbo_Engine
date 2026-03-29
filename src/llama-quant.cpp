@@ -915,6 +915,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     gguf_set_val_u32(ctx_out.get(), "general.quantization_version", GGML_QNT_VERSION); // TODO: use LLM_KV
     gguf_set_val_u32(ctx_out.get(), "general.file_type", ftype); // TODO: use LLM_KV
 
+    // TQ3_0: embed default repeat penalty to prevent repetition loops at 3-bit
+    if (ftype == LLAMA_FTYPE_MOSTLY_TQ3_0) {
+        gguf_set_val_f32(ctx_out.get(), "general.sampling.penalty_repeat", 1.1f);
+    }
+
     // Remove split metadata
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str());
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str());
