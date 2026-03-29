@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_TQ3_0   = 41,
         GGML_TYPE_TQ4_0   = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TQ3_S   = 43, // 3-bit, block_size=32, for KV cache
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision

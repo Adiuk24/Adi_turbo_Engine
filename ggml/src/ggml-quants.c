@@ -2441,6 +2441,57 @@ void dequantize_row_tq4_0(const block_tq4_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== TQ3_S (small-block 3-bit for KV cache)
+
+void quantize_row_tq3_s_ref(const float * GGML_RESTRICT x, block_tq3_s * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_S == 0);
+    const int64_t nb = k / QK_TQ3_S;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK_TQ3_S; j++) {
+            amax = MAX(amax, fabsf(x[j]));
+        }
+
+        const float d = amax / 4.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < QK_TQ3_S/8; j++) {
+            uint32_t p = 0;
+            for (int m = 0; m < 8; m++) {
+                int xi = MIN(7, MAX(0, (int)lroundf(x[8*j + m]*id + 4.0f)));
+                p |= (uint32_t)xi << (3*m);
+            }
+            y[i].qs[3*j + 0] = (p >>  0) & 0xFF;
+            y[i].qs[3*j + 1] = (p >>  8) & 0xFF;
+            y[i].qs[3*j + 2] = (p >> 16) & 0xFF;
+        }
+        x += QK_TQ3_S;
+    }
+}
+
+void dequantize_row_tq3_s(const block_tq3_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_S == 0);
+    const int64_t nb = k / QK_TQ3_S;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < QK_TQ3_S/8; j++) {
+            const uint32_t p = ((uint32_t)x[i].qs[3*j + 0] <<  0) |
+                               ((uint32_t)x[i].qs[3*j + 1] <<  8) |
+                               ((uint32_t)x[i].qs[3*j + 2] << 16);
+
+            for (int m = 0; m < 8; m++) {
+                int xi = (p >> (3*m)) & 7;
+                *y++ = (float)(xi - 4.0f) * d;
+            }
+        }
+    }
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

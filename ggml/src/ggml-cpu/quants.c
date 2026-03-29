@@ -1308,3 +1308,47 @@ void ggml_vec_dot_tq3_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 
     *s = sumf;
 }
+
+// ====================== TQ3_S (small-block 3-bit, block_size=32, for KV cache)
+
+void quantize_row_tq3_s(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ3_S == 0);
+    block_tq3_s * GGML_RESTRICT y = vy;
+    quantize_row_tq3_s_ref(x, y, k);
+}
+
+void ggml_vec_dot_tq3_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    GGML_UNUSED(nrc); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(bs);
+
+    const block_tq3_s * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_S;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        int32_t isum = 0;
+        int32_t ysum = 0;
+
+        for (int j = 0; j < QK_TQ3_S; ++j) {
+            ysum += y[i].qs[j];
+        }
+
+        for (int j = 0; j < QK_TQ3_S/8; ++j) {
+            const uint32_t p = ((uint32_t)x[i].qs[3*j + 0] <<  0) |
+                               ((uint32_t)x[i].qs[3*j + 1] <<  8) |
+                               ((uint32_t)x[i].qs[3*j + 2] << 16);
+            for (int m = 0; m < 8; ++m) {
+                const int xv = (int)((p >> (3*m)) & 7);
+                const int yv = (int)y[i].qs[8*j + m];
+                isum += xv * yv;
+            }
+        }
+
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * GGML_CPU_FP16_TO_FP32(y[i].d);
+        sumf += d * ((float)isum - 4.0f * (float)ysum);
+    }
+
+    *s = sumf;
+}

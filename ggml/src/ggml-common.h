@@ -280,6 +280,14 @@ typedef struct {
 } block_tq4_0;
 static_assert(sizeof(block_tq4_0) == sizeof(ggml_half) + QK_K/2, "wrong tq4_0 block size/padding");
 
+// 3.5 bpw — small-block TQ3 for KV cache (block_size=32)
+#define QK_TQ3_S 32
+typedef struct {
+    uint8_t qs[12]; // 3 bits * 32 = 96 bits = 12 bytes
+    ggml_half d;
+} block_tq3_s;
+static_assert(sizeof(block_tq3_s) == sizeof(ggml_half) + 12, "wrong tq3_s block size/padding");
+
 //
 // Super-block quantization structures
 //
