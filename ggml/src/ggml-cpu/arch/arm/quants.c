@@ -4134,3 +4134,140 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+
+void ggml_vec_dot_tq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    GGML_UNUSED(nrc); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(bs);
+
+    const block_tq4_0 * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+#if defined(__ARM_NEON)
+    float sumf = 0.0f;
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+
+    for (int i = 0; i < nb; ++i) {
+        int32x4_t isumv = vdupq_n_s32(0);
+        int32_t ysum = 0;
+
+        for (int k = 0; k < QK_K/16; ++k) {
+            ysum += y[i].bsums[k];
+        }
+
+        for (int j = 0; j < QK_K/2; j += 16) {
+            const uint8x16_t x_v = vld1q_u8(x[i].qs + j);
+            const int8x16_t  y0_v = vld1q_s8(y[i].qs + 2*j);
+            const int8x16_t  y1_v = vld1q_s8(y[i].qs + 2*j + 16);
+
+            const uint8x16_t x0_u = vandq_u8(x_v, mask);
+            const uint8x16_t x1_u = vshrq_n_u8(x_v, 4);
+
+            const uint8x16x2_t zipped = vzipq_u8(x0_u, x1_u);
+            const int8x16_t x0_v = vreinterpretq_s8_u8(zipped.val[0]);
+            const int8x16_t x1_v = vreinterpretq_s8_u8(zipped.val[1]);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+            isumv = vdotq_s32(isumv, x0_v, y0_v);
+            isumv = vdotq_s32(isumv, x1_v, y1_v);
+#else
+            const int16x8_t p0l = vmull_s8(vget_low_s8(x0_v), vget_low_s8(y0_v));
+            const int16x8_t p0h = vmull_s8(vget_high_s8(x0_v), vget_high_s8(y0_v));
+            const int16x8_t p1l = vmull_s8(vget_low_s8(x1_v), vget_low_s8(y1_v));
+            const int16x8_t p1h = vmull_s8(vget_high_s8(x1_v), vget_high_s8(y1_v));
+
+            isumv = vaddq_s32(isumv, vpaddlq_s16(vaddq_s16(p0l, p0h)));
+            isumv = vaddq_s32(isumv, vpaddlq_s16(vaddq_s16(p1l, p1h)));
+#endif
+        }
+
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        sumf += d * ((float)vaddvq_s32(isumv) - 8.0f * (float)ysum);
+    }
+    *s = sumf;
+#else
+    ggml_vec_dot_tq4_0_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_tq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    GGML_UNUSED(nrc); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(bs);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+#if defined(__ARM_NEON)
+    float sumf = 0.0f;
+
+    // 3-bit extraction via table lookup + variable shift.
+    // Each group of 3 bytes packs 8 values at 3 bits each (24 bits).
+    // Per group [b0,b1,b2]:
+    //   v0=(b0>>0)&7  v1=(b0>>3)&7  v2=((b0>>6)|(b1<<2))&7
+    //   v3=(b1>>1)&7  v4=(b1>>4)&7  v5=((b1>>7)|(b2<<1))&7
+    //   v6=(b2>>2)&7  v7=(b2>>5)&7
+    // Process 4 groups (32 values) per iteration via 16-byte table lookup.
+
+    static const uint8_t shuf_a0[16] = {0,0,0, 1,1,1, 2,2, 3,3,3, 4,4,4, 5,5};
+    static const uint8_t shuf_a1[16] = {6,6,6, 7,7,7, 8,8, 9,9,9, 10,10,10, 11,11};
+    static const int8_t  shift_a[16] = {0,-3,-6, -1,-4,-7, -2,-5, 0,-3,-6, -1,-4,-7, -2,-5};
+    static const uint8_t shuf_b0[16] = {0x80,0x80,1, 0x80,0x80,2, 0x80,0x80, 0x80,0x80,4, 0x80,0x80,5, 0x80,0x80};
+    static const uint8_t shuf_b1[16] = {0x80,0x80,7, 0x80,0x80,8, 0x80,0x80, 0x80,0x80,10, 0x80,0x80,11, 0x80,0x80};
+    static const int8_t  shift_b[16] = {0,0,2, 0,0,1, 0,0, 0,0,2, 0,0,1, 0,0};
+
+    const uint8x16_t shuf_a0_v = vld1q_u8(shuf_a0);
+    const uint8x16_t shuf_a1_v = vld1q_u8(shuf_a1);
+    const int8x16_t  shift_a_v = vld1q_s8(shift_a);
+    const uint8x16_t shuf_b0_v = vld1q_u8(shuf_b0);
+    const uint8x16_t shuf_b1_v = vld1q_u8(shuf_b1);
+    const int8x16_t  shift_b_v = vld1q_s8(shift_b);
+    const uint8x16_t mask7     = vdupq_n_u8(0x07);
+
+    for (int i = 0; i < nb; ++i) {
+        int32x4_t isumv = vdupq_n_s32(0);
+
+        const int16x8_t bs0 = vld1q_s16(y[i].bsums);
+        const int16x8_t bs1 = vld1q_s16(y[i].bsums + 8);
+        const int32_t ysum = vaddlvq_s16(vaddq_s16(bs0, bs1));
+
+        for (int j = 0; j < QK_K/8; j += 4) {
+            const uint8x16_t src = vld1q_u8(x[i].qs + 3*j);
+
+            // Groups 0,1: extract 16 three-bit values
+            const uint8x16_t va0 = vshlq_u8(vqtbl1q_u8(src, shuf_a0_v), shift_a_v);
+            const uint8x16_t vb0 = vshlq_u8(vqtbl1q_u8(src, shuf_b0_v), shift_b_v);
+            const int8x16_t x0 = vreinterpretq_s8_u8(vandq_u8(vorrq_u8(va0, vb0), mask7));
+
+            // Groups 2,3: extract 16 three-bit values
+            const uint8x16_t va1 = vshlq_u8(vqtbl1q_u8(src, shuf_a1_v), shift_a_v);
+            const uint8x16_t vb1 = vshlq_u8(vqtbl1q_u8(src, shuf_b1_v), shift_b_v);
+            const int8x16_t x1 = vreinterpretq_s8_u8(vandq_u8(vorrq_u8(va1, vb1), mask7));
+
+            const int8x16_t y0 = vld1q_s8(y[i].qs + 8*j);
+            const int8x16_t y1 = vld1q_s8(y[i].qs + 8*j + 16);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+            isumv = vdotq_s32(isumv, x0, y0);
+            isumv = vdotq_s32(isumv, x1, y1);
+#else
+            const int16x8_t p0l = vmull_s8(vget_low_s8(x0), vget_low_s8(y0));
+            const int16x8_t p0h = vmull_s8(vget_high_s8(x0), vget_high_s8(y0));
+            const int16x8_t p1l = vmull_s8(vget_low_s8(x1), vget_low_s8(y1));
+            const int16x8_t p1h = vmull_s8(vget_high_s8(x1), vget_high_s8(y1));
+            isumv = vaddq_s32(isumv, vpaddlq_s16(vaddq_s16(p0l, p0h)));
+            isumv = vaddq_s32(isumv, vpaddlq_s16(vaddq_s16(p1l, p1h)));
+#endif
+        }
+
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        sumf += d * ((float)vaddvq_s32(isumv) - 4.0f * (float)ysum);
+    }
+
+    *s = sumf;
+#else
+    ggml_vec_dot_tq3_0_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
