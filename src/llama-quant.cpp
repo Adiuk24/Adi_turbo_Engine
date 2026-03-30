@@ -488,6 +488,38 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 new_type = GGML_TYPE_Q4_K;
             }
         }
+    } else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 ||
+               ftype == LLAMA_FTYPE_MOSTLY_TQ3_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ4_0) {
+        // MoE-aware per-tensor routing for TQ types.
+        // Without this, MoE gate/attention tensors get flat ternary which destroys routing.
+        // Mirrors the IQ2 logic below but uses Q4_K/Q5_K for sensitive tensors.
+        if (category_is_attn_v(category)) {
+            if (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) new_type = GGML_TYPE_Q4_K;
+            else new_type = GGML_TYPE_Q3_K;
+            ++qs.i_attention_wv;
+        }
+        else if (qs.model.hparams.n_expert >= 4 && category == tensor_category::ATTENTION_K) {
+            new_type = GGML_TYPE_Q4_K;
+        }
+        else if (category == tensor_category::ATTENTION_OUTPUT) {
+            if (qs.model.hparams.n_expert >= 4) {
+                new_type = GGML_TYPE_Q5_K;
+            }
+        }
+        else if (category == tensor_category::FFN_GATE) {
+            // MoE gate tensors (ffn_gate_inp) are critical for expert routing.
+            // Must preserve precision — flat ternary here destroys routing entirely.
+            if (qs.model.hparams.n_expert >= 4) {
+                new_type = GGML_TYPE_Q8_0;
+            }
+        }
+        else if (category == tensor_category::FFN_DOWN) {
+            // First 1/8 of FFN_DOWN layers get higher precision (same as IQ2 logic)
+            if (qs.i_ffn_down < qs.n_ffn_down/8) {
+                new_type = GGML_TYPE_Q3_K;
+            }
+            ++qs.i_ffn_down;
+        }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
                ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
         if (category_is_attn_v(category)) {
