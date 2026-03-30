@@ -7971,6 +7971,12 @@ kernel void kernel_mul_mv_q6_K_f32(
 }
 
 // ======================= TurboQuant TQ4_0 / TQ3_0
+//
+// NOTE: These kernels assume contiguous weight tensor layout (row stride = nb blocks).
+// The pointer `x` is positioned at first_row via args.nb01, and within the nr0 rows
+// processed per threadgroup, row indexing uses `x + ib + row * nb` which is valid
+// because weight tensors in llama.cpp are always contiguous.  If non-contiguous
+// weight layouts are ever needed, the stride must be derived from args.nb01 instead.
 
 template<int nr0, typename args_t>
 void kernel_mul_mv_tq4_0_f32_impl(

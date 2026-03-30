@@ -2267,29 +2267,210 @@ void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RE
 }
 
 size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    (void)imatrix; // not used
+    // TODO: TQ1_0 uses base-3 encoding which makes imatrix-weighted scale search
+    // significantly more complex.  Leaving unweighted for now.
+    (void)imatrix;
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
     quantize_row_tq1_0_ref(src, dst, nrows*n_per_row);
     return nrows * row_size;
 }
 
 size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    (void)imatrix; // not used
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb = n_per_row / QK_K;
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_0, n_per_row);
-    quantize_row_tq2_0_ref(src, dst, nrows*n_per_row);
+
+    block_tq2_0 * y = (block_tq2_0 *) dst;
+    const float * x = src;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float * row_imatrix = imatrix; // imatrix is per-row (n_per_row elements)
+        for (int64_t i = 0; i < nb; ++i) {
+            const float * xb = x + i * QK_K;
+            const float * wb = row_imatrix ? row_imatrix + i * QK_K : NULL;
+
+            float amax = 0.0f;
+            for (int j = 0; j < QK_K; j++) {
+                amax = MAX(amax, fabsf(xb[j]));
+            }
+
+            float d = amax;
+
+            // If imatrix is available, find scale minimizing importance-weighted MSE
+            if (wb && amax > 0.0f) {
+                float best_d = amax;
+                float best_err = FLT_MAX;
+                for (int trial = 0; trial < 9; trial++) {
+                    float d_try = amax * (0.8f + 0.05f * trial);
+                    if (d_try == 0.0f) continue;
+                    float id_try = 1.0f / d_try;
+                    float err = 0.0f;
+                    for (int j = 0; j < QK_K; j++) {
+                        float v = xb[j];
+                        int xi = lroundf(v * id_try);
+                        xi = xi < -1 ? -1 : (xi > 1 ? 1 : xi);
+                        float recon = xi * d_try;
+                        err += wb[j] * (v - recon) * (v - recon);
+                    }
+                    if (err < best_err) {
+                        best_err = err;
+                        best_d = d_try;
+                    }
+                }
+                d = best_d;
+            }
+
+            const float id = d ? 1.0f / d : 0.0f;
+            y[row * nb + i].d = GGML_FP32_TO_FP16(d);
+
+            const float * xp = xb;
+            block_tq2_0 * yb = &y[row * nb + i];
+            for (size_t j = 0; j < sizeof(yb->qs); j += 32) {
+                for (size_t m = 0; m < 32; ++m) {
+                    uint8_t q = 0;
+                    for (size_t n = 0; n < 4; ++n) {
+                        int xi = lroundf(xp[m + n*32] * id) + 1;
+                        xi = xi < 0 ? 0 : (xi > 2 ? 2 : xi);
+                        q += (xi & 3) << (2*n);
+                    }
+                    yb->qs[j + m] = q;
+                }
+                xp += 4*32;
+            }
+        }
+        x += n_per_row;
+    }
     return nrows * row_size;
 }
+
 size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    (void)imatrix; // not used
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb = n_per_row / QK_K;
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);
-    quantize_row_tq3_0_ref(src, dst, nrows*n_per_row);
+
+    block_tq3_0 * y = (block_tq3_0 *) dst;
+    const float * x = src;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float * row_imatrix = imatrix;
+        for (int64_t i = 0; i < nb; ++i) {
+            const float * xb = x + i * QK_K;
+            const float * wb = row_imatrix ? row_imatrix + i * QK_K : NULL;
+
+            float amax = 0.0f;
+            for (int j = 0; j < QK_K; j++) {
+                amax = MAX(amax, fabsf(xb[j]));
+            }
+
+            // 3-bit symmetric: 8 levels, centre at 4 (values 0..7 representing -4*d..+3*d)
+            float d = amax / 4.0f;
+
+            // If imatrix is available, find scale minimizing importance-weighted MSE
+            if (wb && amax > 0.0f) {
+                float base_d = amax / 4.0f;
+                float best_d = base_d;
+                float best_err = FLT_MAX;
+                for (int trial = 0; trial < 9; trial++) {
+                    float d_try = base_d * (0.8f + 0.05f * trial);
+                    if (d_try == 0.0f) continue;
+                    float id_try = 1.0f / d_try;
+                    float err = 0.0f;
+                    for (int j = 0; j < QK_K; j++) {
+                        float v = xb[j];
+                        int xi = MIN(7, MAX(0, (int)lroundf(v * id_try + 4.0f)));
+                        float recon = (xi - 4.0f) * d_try;
+                        err += wb[j] * (v - recon) * (v - recon);
+                    }
+                    if (err < best_err) {
+                        best_err = err;
+                        best_d = d_try;
+                    }
+                }
+                d = best_d;
+            }
+
+            const float id = d ? 1.0f / d : 0.0f;
+            y[row * nb + i].d = GGML_FP32_TO_FP16(d);
+
+            for (int j = 0; j < QK_K/8; j++) {
+                uint32_t p = 0;
+                for (int m = 0; m < 8; m++) {
+                    int xi = MIN(7, MAX(0, (int)lroundf(xb[8*j + m] * id + 4.0f)));
+                    p |= (uint32_t)xi << (3*m);
+                }
+                y[row * nb + i].qs[3*j + 0] = (p >>  0) & 0xFF;
+                y[row * nb + i].qs[3*j + 1] = (p >>  8) & 0xFF;
+                y[row * nb + i].qs[3*j + 2] = (p >> 16) & 0xFF;
+            }
+        }
+        x += n_per_row;
+    }
     return nrows * row_size;
 }
 
 size_t quantize_tq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    (void)imatrix; // not used
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb = n_per_row / QK_K;
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ4_0, n_per_row);
-    quantize_row_tq4_0_ref(src, dst, nrows*n_per_row);
+
+    block_tq4_0 * y = (block_tq4_0 *) dst;
+    const float * x = src;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float * row_imatrix = imatrix;
+        for (int64_t i = 0; i < nb; ++i) {
+            const float * xb = x + i * QK_K;
+            const float * wb = row_imatrix ? row_imatrix + i * QK_K : NULL;
+
+            float amax = 0.0f;
+            for (int j = 0; j < QK_K; j++) {
+                amax = MAX(amax, fabsf(xb[j]));
+            }
+
+            float d = amax / 8.0f;
+
+            // If imatrix is available, find scale minimizing importance-weighted MSE
+            if (wb && amax > 0.0f) {
+                float base_d = amax / 8.0f;
+                float best_d = base_d;
+                float best_err = FLT_MAX;
+                for (int trial = 0; trial < 9; trial++) {
+                    float d_try = base_d * (0.8f + 0.05f * trial);
+                    if (d_try == 0.0f) continue;
+                    float id_try = 1.0f / d_try;
+                    float err = 0.0f;
+                    for (int j = 0; j < QK_K; j++) {
+                        float v = xb[j];
+                        int xi = MIN(15, MAX(0, (int)lroundf(v * id_try + 8.0f)));
+                        float recon = (xi - 8.0f) * d_try;
+                        err += wb[j] * (v - recon) * (v - recon);
+                    }
+                    if (err < best_err) {
+                        best_err = err;
+                        best_d = d_try;
+                    }
+                }
+                d = best_d;
+            }
+
+            const float id = d ? 1.0f / d : 0.0f;
+            y[row * nb + i].d = GGML_FP32_TO_FP16(d);
+
+            for (int j = 0; j < QK_K/2; j++) {
+                int xi0 = MIN(15, MAX(0, (int)lroundf(xb[2*j + 0] * id + 8.0f)));
+                int xi1 = MIN(15, MAX(0, (int)lroundf(xb[2*j + 1] * id + 8.0f)));
+                y[row * nb + i].qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
+            }
+        }
+        x += n_per_row;
+    }
+    return nrows * row_size;
+}
+
+size_t quantize_tq3_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    (void)imatrix; // TQ3_S is for KV cache, imatrix not applicable
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_S, n_per_row);
+    quantize_row_tq3_s_ref(src, dst, nrows*n_per_row);
     return nrows * row_size;
 }
 

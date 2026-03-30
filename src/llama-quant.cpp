@@ -1067,8 +1067,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             ctx_outs[i_split].reset(gguf_init_empty());
         }
 
-        // MOE PADDING: If ncols = 2880, pad to 3072 to enable TQ/IQ 256-block kernels
-        if (tensor->ne[0] == 2880 && (metadata[i].category == tensor_category::FFN_DOWN || metadata[i].category == tensor_category::FFN_GATE || metadata[i].category == tensor_category::FFN_UP)) {
+        // MOE PADDING: If ncols = 2880, pad to 3072 to enable TQ 256-block kernels.
+        // Only fire for TQ ftypes -- other quant types handle 2880 natively or via their own blocking.
+        if (tensor->ne[0] == 2880 &&
+            (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 ||
+             ftype == LLAMA_FTYPE_MOSTLY_TQ3_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ4_0) &&
+            (metadata[i].category == tensor_category::FFN_DOWN || metadata[i].category == tensor_category::FFN_GATE || metadata[i].category == tensor_category::FFN_UP)) {
             const_cast<struct ggml_tensor *>(tensor)->ne[0] = 3072;
         }
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
@@ -1283,15 +1287,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+                // When padding is active (2880->3072), the source data still has the
+                // original 2880 stride per row.  Compute the true source stride so that
+                // expert indexing reads from the correct offset in f32_data.
+                const bool     is_padded       = (n_per_row == 3072 && cur_type == GGML_TYPE_F32);
+                const int64_t  src_n_per_row   = is_padded ? 2880 : n_per_row;
+                const int64_t  src_elems_matrix = src_n_per_row * nrows;
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
-                    const float * f32_data_03 = f32_data + i03 * nelements_matrix;
+                    const float * f32_data_03 = f32_data + i03 * src_elems_matrix;
                     void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
                     const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
                     // PADDING EXECUTION: Buffer 2880 -> 3072
-                    if (n_per_row == 3072) {
+                    if (is_padded) {
                         std::vector<float> padded_row(3072 * nrows, 0.0f);
                         for (int64_t r = 0; r < nrows; ++r) {
                             memcpy(padded_row.data() + r * 3072, f32_data_03 + r * 2880, 2880 * sizeof(float));
