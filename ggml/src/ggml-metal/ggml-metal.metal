@@ -746,9 +746,14 @@ void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & 
 
 template <typename type4x4>
 void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
-    // il ranges 0-15, each selects 16 values from the 256-element block
-    // TQ1_0 packs 5 ternary values per byte (3^5=243 < 256)
-    // qs has (QK_K - 4*QK_K/64)/5 bytes for main, qh has QK_K/64 bytes for remainder
+    // il ranges 0-15, each selects 16 values from the 256-element block.
+    // CPU layout is STRIDED, not linear:
+    //   qs[0..31] (32 bytes): for digit n in 0..4, for byte m in 0..31: output[n*32+m] = decode(qs[m], digit n)
+    //     → 160 elements, output positions: digit0=[0..31], digit1=[32..63], ..., digit4=[128..159]
+    //   qs[32..47] (16 bytes): same pattern but stride=16
+    //     → 80 elements, output positions: [160..175], [176..191], ..., [224..239]
+    //   qh[0..3] (4 bytes): 4 digits per byte, stride=4
+    //     → 16 elements, output positions: [240..243], [244..247], [248..251], [252..255]
     const float d = xb->d;
     const uchar pow3_vals[5] = {1, 3, 9, 27, 81};
 
@@ -759,20 +764,23 @@ void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & 
         int elem = elem_base + j;
         int xi;
         if (elem < 160) {
-            int byte_idx = elem / 5;
-            int digit    = elem % 5;
+            // Section 1: qs[0..31], 5 digits, stride 32
+            int digit    = elem / 32;        // which of 5 digits (0-4)
+            int byte_idx = elem % 32;        // which byte in the 32-byte group
             uchar q = xb->qs[byte_idx] * pow3_vals[digit];
             xi = ((ushort)q * 3) >> 8;
         } else if (elem < 240) {
-            int local = elem - 160;
-            int byte_idx = 32 + local / 5;
-            int digit    = local % 5;
+            // Section 2: qs[32..47], 5 digits, stride 16
+            int local    = elem - 160;
+            int digit    = local / 16;       // which of 5 digits (0-4)
+            int byte_idx = 32 + local % 16;  // which byte in the 16-byte group
             uchar q = xb->qs[byte_idx] * pow3_vals[digit];
             xi = ((ushort)q * 3) >> 8;
         } else {
-            int local = elem - 240;
-            int byte_idx = local / 4;
-            int digit    = local % 4;
+            // Section 3: qh[0..3], 4 digits, stride 4
+            int local    = elem - 240;
+            int digit    = local / 4;        // which of 4 digits (0-3)
+            int byte_idx = local % 4;        // which byte
             uchar q = xb->qh[byte_idx] * pow3_vals[digit];
             xi = ((ushort)q * 3) >> 8;
         }
@@ -8285,23 +8293,24 @@ void kernel_mul_mv_tq1_0_f32_impl(
                 int elem = elem_base + j;
                 int xi;
                 if (elem < 160) {
-                    // First section: qs[0..31], 5 elements per byte
-                    int byte_idx = elem / 5;
-                    int digit    = elem % 5;
+                    // Section 1: qs[0..31], 5 digits, stride 32
+                    // CPU layout: byte m, digit n → output position n*32 + m
+                    int digit    = elem / 32;
+                    int byte_idx = elem % 32;
                     uchar q = xr->qs[byte_idx] * pow3_vals[digit];
                     xi = ((ushort)q * 3) >> 8;
                 } else if (elem < 240) {
-                    // Second section: qs[32..47], 5 elements per byte
-                    int local = elem - 160;
-                    int byte_idx = 32 + local / 5;
-                    int digit    = local % 5;
+                    // Section 2: qs[32..47], 5 digits, stride 16
+                    int local    = elem - 160;
+                    int digit    = local / 16;
+                    int byte_idx = 32 + local % 16;
                     uchar q = xr->qs[byte_idx] * pow3_vals[digit];
                     xi = ((ushort)q * 3) >> 8;
                 } else {
-                    // Last section: qh[0..3], 4 elements per byte (pow3[0..3])
-                    int local = elem - 240;
-                    int byte_idx = local / 4;
-                    int digit    = local % 4;
+                    // Section 3: qh[0..3], 4 digits, stride 4
+                    int local    = elem - 240;
+                    int digit    = local / 4;
+                    int byte_idx = local % 4;
                     uchar q = xr->qh[byte_idx] * pow3_vals[digit];
                     xi = ((ushort)q * 3) >> 8;
                 }

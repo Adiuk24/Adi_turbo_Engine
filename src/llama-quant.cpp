@@ -386,7 +386,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_TQ1_0:
             case GGML_TYPE_TQ2_0:
             case GGML_TYPE_TQ3_0:
-            case GGML_TYPE_TQ4_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_TQ4_0:   return_type = GGML_TYPE_IQ3_XXS; break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -512,13 +512,23 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             if (qs.model.hparams.n_expert >= 4) {
                 new_type = GGML_TYPE_Q8_0;
             }
+            ++qs.i_ffn_gate;
         }
         else if (category == tensor_category::FFN_DOWN) {
-            // First 1/8 of FFN_DOWN layers get higher precision (same as IQ2 logic)
+            if (tensor->ne[0] % 256 != 0) {
+                new_type = ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 ? GGML_TYPE_IQ2_XS : GGML_TYPE_IQ3_XXS;
+            }
+            // First 1/8 of FFN_DOWN layers get higher precision
             if (qs.i_ffn_down < qs.n_ffn_down/8) {
                 new_type = GGML_TYPE_Q3_K;
             }
             ++qs.i_ffn_down;
+        }
+        else if (category == tensor_category::FFN_UP) {
+            if (tensor->ne[0] % 256 != 0) {
+                new_type = ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 ? GGML_TYPE_IQ2_XS : GGML_TYPE_IQ3_XXS;
+            }
+            ++qs.i_ffn_up;
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
                ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
@@ -851,7 +861,7 @@ static ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:  return GGML_TYPE_Q5_K;
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;
-        case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ1_0; // Wait, this is still weird but I'll follow my add
+        case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
         case LLAMA_FTYPE_MOSTLY_TQ3_0:   return GGML_TYPE_TQ3_0;
         case LLAMA_FTYPE_MOSTLY_TQ4_0:   return GGML_TYPE_TQ4_0;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
@@ -1056,6 +1066,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
+
+        // MOE PADDING: If ncols = 2880, pad to 3072 to enable TQ/IQ 256-block kernels
+        if (tensor->ne[0] == 2880 && (metadata[i].category == tensor_category::FFN_DOWN || metadata[i].category == tensor_category::FFN_GATE || metadata[i].category == tensor_category::FFN_UP)) {
+            const_cast<struct ggml_tensor *>(tensor)->ne[0] = 3072;
+        }
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
 
         metadata[i].allows_quantization = tensor_allows_quantization(params, model.arch, tensor);
@@ -1243,7 +1258,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 if (tensor->type == GGML_TYPE_F32) {
                     f32_data = (float *) tensor->data;
-                } else if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
+                } else if (ggml_is_quantized(tensor->type) && tensor->type != GGML_TYPE_IQ4_NL && tensor->type != GGML_TYPE_MXFP4 && !params->allow_requantize) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 } else {
                     llama_tensor_dequantize_impl(tensor, f32_conv_buf, workers, nelements, nthread);
@@ -1275,7 +1290,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
                     const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
-                    new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                    // PADDING EXECUTION: Buffer 2880 -> 3072
+                    if (n_per_row == 3072) {
+                        std::vector<float> padded_row(3072 * nrows, 0.0f);
+                        for (int64_t r = 0; r < nrows; ++r) {
+                            memcpy(padded_row.data() + r * 3072, f32_data_03 + r * 2880, 2880 * sizeof(float));
+                        }
+                        new_size += llama_tensor_quantize_impl(new_type, padded_row.data(), new_data_03, chunk_size, nrows, 3072, imatrix_03, workers, nthread_use);
+                    } else {
+                        new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                    }
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }

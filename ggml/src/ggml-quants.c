@@ -2254,8 +2254,9 @@ void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RE
             for (size_t m = 0; m < 32; ++m) {
                 uint8_t q = 0;
                 for (size_t n = 0; n < 4; ++n) {
-                    // -1, 0, 1 -> 0, 1, 2
+                    // -1, 0, 1 -> 0, 1, 2 (clamped to valid ternary range)
                     int xi = lroundf(x[m + n*32] * id) + 1;
+                    xi = xi < 0 ? 0 : (xi > 2 ? 2 : xi);
                     q += (xi & 3) << (2*n);
                 }
                 y[i].qs[j + m] = q;
