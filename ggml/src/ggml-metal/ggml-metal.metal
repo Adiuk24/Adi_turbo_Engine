@@ -726,6 +726,62 @@ void dequantize_tq3_0(device const block_tq3_0 * xb, short il, thread type4x4 & 
 }
 
 template <typename type4x4>
+void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & reg) {
+    // il ranges 0-15, each selects 16 values from the 256-element block
+    // 2-bit packed: 4 values per byte, qs has QK_K/4 = 64 bytes
+    // 16 values = 4 bytes
+    device const uint8_t * qs = xb->qs + il * 4;
+    const float d = xb->d;
+
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t q = qs[i];
+        reg_f[i][0] = d * ((float)((q >> 0) & 3) - 1.0f);
+        reg_f[i][1] = d * ((float)((q >> 2) & 3) - 1.0f);
+        reg_f[i][2] = d * ((float)((q >> 4) & 3) - 1.0f);
+        reg_f[i][3] = d * ((float)((q >> 6) & 3) - 1.0f);
+    }
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
+    // il ranges 0-15, each selects 16 values from the 256-element block
+    // TQ1_0 packs 5 ternary values per byte (3^5=243 < 256)
+    // qs has (QK_K - 4*QK_K/64)/5 bytes for main, qh has QK_K/64 bytes for remainder
+    const float d = xb->d;
+    const uchar pow3_vals[5] = {1, 3, 9, 27, 81};
+
+    float4x4 reg_f;
+    int elem_base = il * 16;
+
+    for (int j = 0; j < 16; j++) {
+        int elem = elem_base + j;
+        int xi;
+        if (elem < 160) {
+            int byte_idx = elem / 5;
+            int digit    = elem % 5;
+            uchar q = xb->qs[byte_idx] * pow3_vals[digit];
+            xi = ((ushort)q * 3) >> 8;
+        } else if (elem < 240) {
+            int local = elem - 160;
+            int byte_idx = 32 + local / 5;
+            int digit    = local % 5;
+            uchar q = xb->qs[byte_idx] * pow3_vals[digit];
+            xi = ((ushort)q * 3) >> 8;
+        } else {
+            int local = elem - 240;
+            int byte_idx = local / 4;
+            int digit    = local % 4;
+            uchar q = xb->qh[byte_idx] * pow3_vals[digit];
+            xi = ((ushort)q * 3) >> 8;
+        }
+        reg_f[j/4][j%4] = d * ((float)xi - 1.0f);
+    }
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
 void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x4 & reg) {
     // il is 0...15 for QK_K = 256 => index of block of 32 is il/2
     const float d = xb->d;
@@ -3828,6 +3884,16 @@ template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_2")]] kernel mul_mv_ext_q4x
 template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_tq3_0, 256, dequantize_tq3_0>;
 template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_tq3_0, 256, dequantize_tq3_0>;
 template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_tq3_0, 256, dequantize_tq3_0>;
+
+template [[host_name("kernel_mul_mv_ext_tq2_0_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_tq2_0, 256, dequantize_tq2_0>;
+template [[host_name("kernel_mul_mv_ext_tq2_0_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_tq2_0, 256, dequantize_tq2_0>;
+template [[host_name("kernel_mul_mv_ext_tq2_0_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_tq2_0, 256, dequantize_tq2_0>;
+template [[host_name("kernel_mul_mv_ext_tq2_0_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_tq2_0, 256, dequantize_tq2_0>;
+
+template [[host_name("kernel_mul_mv_ext_tq1_0_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_tq1_0, 256, dequantize_tq1_0>;
+template [[host_name("kernel_mul_mv_ext_tq1_0_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_tq1_0, 256, dequantize_tq1_0>;
+template [[host_name("kernel_mul_mv_ext_tq1_0_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_tq1_0, 256, dequantize_tq1_0>;
+template [[host_name("kernel_mul_mv_ext_tq1_0_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_tq1_0, 256, dequantize_tq1_0>;
 
 template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_q2_K, 256, dequantize_q2_K>;
 template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_q2_K, 256, dequantize_q2_K>;
@@ -8062,6 +8128,211 @@ kernel void kernel_mul_mv_tq3_0_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
     kernel_mul_mv_tq3_0_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+// ======================= TurboQuant TQ2_0 / TQ1_0
+
+template<int nr0, typename args_t>
+void kernel_mul_mv_tq2_0_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_K;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_tq2_0 * x = (device const block_tq2_0 *) (src0 + offset0);
+    device const float       * y = (device const float       *) (src1 + offset1);
+
+    // Each thread handles 8 elements per block (32 threads × 8 = 256 elements)
+    const short tid = tiisg;
+
+    float sumf[nr0] = {0.f};
+
+    for (int ib = 0; ib < nb; ib++) {
+        device const float * yb = y + ib * QK_K + tid * 8;
+
+        float sumy = 0.f;
+        float yl[8];
+        for (int j = 0; j < 8; j++) {
+            yl[j] = yb[j];
+            sumy += yl[j];
+        }
+
+        for (short row = 0; row < nr0; row++) {
+            device const block_tq2_0 * xr = x + ib + row * nb;
+            // 8 values = 2 bytes (4 values per byte at 2 bits each)
+            device const uint8_t * qs = xr->qs + tid * 2;
+            const float d = xr->d;
+
+            float acc = 0.f;
+            for (int j = 0; j < 2; j++) {
+                const uint8_t q = qs[j];
+                acc += yl[4*j + 0] * (float)((q >> 0) & 3);
+                acc += yl[4*j + 1] * (float)((q >> 2) & 3);
+                acc += yl[4*j + 2] * (float)((q >> 4) & 3);
+                acc += yl[4*j + 3] * (float)((q >> 6) & 3);
+            }
+
+            sumf[row] += d * (acc - 1.f * sumy);
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_tq2_0_f32")]]
+kernel void kernel_mul_mv_tq2_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_tq2_0_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+template<int nr0, typename args_t>
+void kernel_mul_mv_tq1_0_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_K;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_tq1_0 * x = (device const block_tq1_0 *) (src0 + offset0);
+    device const float       * y = (device const float       *) (src1 + offset1);
+
+    // TQ1_0 packs 5 ternary values per byte (3^5 = 243 < 256)
+    // Each thread handles 5 elements from one byte position
+    // 32 threads × 8 elements = 256 elements per block
+    const short tid = tiisg;
+
+    float sumf[nr0] = {0.f};
+
+    // Lookup table for ternary extraction: pow3[i] maps byte to ternary digit i
+    // Extract digit n from byte b: ((b * pow3[n] * 3) >> 8) gives {0,1,2}
+    // We use the same trick as the CPU code: q = byte * pow3[n]; xi = (q*3)>>8; val = xi-1
+    const uchar pow3_vals[5] = {1, 3, 9, 27, 81};
+
+    for (int ib = 0; ib < nb; ib++) {
+        device const float * yb = y + ib * QK_K + tid * 8;
+
+        float sumy = 0.f;
+        float yl[8];
+        for (int j = 0; j < 8; j++) {
+            yl[j] = yb[j];
+            sumy += yl[j];
+        }
+
+        for (short row = 0; row < nr0; row++) {
+            device const block_tq1_0 * xr = x + ib + row * nb;
+            const float d = xr->d;
+
+            // Map thread to byte position: 256 elements / 5 per byte = ~51 bytes in qs
+            // Thread tid handles elements [tid*8 .. tid*8+7]
+            // Element idx maps to: byte = idx/5, digit = idx%5
+            // But qs layout is: first 32 bytes encode 160 elements (5 per byte),
+            // next 16 bytes encode 80 elements, then qh[4] encode 16 elements (4 per byte)
+            // Total: 160 + 80 + 16 = 256
+
+            float acc = 0.f;
+            int elem_base = tid * 8;
+
+            for (int j = 0; j < 8; j++) {
+                int elem = elem_base + j;
+                int xi;
+                if (elem < 160) {
+                    // First section: qs[0..31], 5 elements per byte
+                    int byte_idx = elem / 5;
+                    int digit    = elem % 5;
+                    uchar q = xr->qs[byte_idx] * pow3_vals[digit];
+                    xi = ((ushort)q * 3) >> 8;
+                } else if (elem < 240) {
+                    // Second section: qs[32..47], 5 elements per byte
+                    int local = elem - 160;
+                    int byte_idx = 32 + local / 5;
+                    int digit    = local % 5;
+                    uchar q = xr->qs[byte_idx] * pow3_vals[digit];
+                    xi = ((ushort)q * 3) >> 8;
+                } else {
+                    // Last section: qh[0..3], 4 elements per byte (pow3[0..3])
+                    int local = elem - 240;
+                    int byte_idx = local / 4;
+                    int digit    = local % 4;
+                    uchar q = xr->qh[byte_idx] * pow3_vals[digit];
+                    xi = ((ushort)q * 3) >> 8;
+                }
+                acc += yl[j] * (float)xi;
+            }
+
+            sumf[row] += d * (acc - 1.f * sumy);
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_tq1_0_f32")]]
+kernel void kernel_mul_mv_tq1_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_tq1_0_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
 // ======================= "True" 2-bit
