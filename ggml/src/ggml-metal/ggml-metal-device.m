@@ -630,8 +630,20 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
     if (dev->mtl_device == nil) {
         dev->mtl_device = MTLCreateSystemDefaultDevice();
 
+        if (dev->mtl_device == nil) {
+            NSArray * devices = MTLCopyAllDevices();
+            if ([devices count] > 0) {
+                dev->mtl_device = [devices objectAtIndex:0];
+                [dev->mtl_device retain];
+            }
+            [devices release];
+        }
+
         if (dev->mtl_device) {
             dev->mtl_queue = [dev->mtl_device newCommandQueue];
+            if (dev->mtl_queue == nil) {
+                dev->mtl_queue = [dev->mtl_device newCommandQueueWithMaxCommandBufferCount:1];
+            }
             if (dev->mtl_queue == nil) {
                 GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
             }
