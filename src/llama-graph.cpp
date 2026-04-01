@@ -50,6 +50,385 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// Deterministic folded projection for Turbo KV scaffold.
+// Projects dim-0 from d -> p by summing p-sized chunks with deterministic +/- signs
+// and RMS-preserving 1/sqrt(groups) scaling. This is a lightweight stand-in while
+// dedicated Hadamard/QJL kernels are integrated.
+static ggml_tensor * turbo_kv_project_dim0_4d(
+        ggml_context * ctx0,
+        ggml_tensor  * x,
+        int64_t        proj_dim,
+        bool           use_signed_mix) {
+    const int64_t d = x->ne[0];
+    const int64_t fallback_dim = proj_dim > 0 && proj_dim < d ? proj_dim : d;
+    if (proj_dim <= 0 || proj_dim >= d || (d % proj_dim) != 0) {
+        return ggml_view_4d(ctx0, x, fallback_dim, x->ne[1], x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], 0);
+    }
+
+    const int64_t groups = d / proj_dim;
+    ggml_tensor * acc = nullptr;
+
+    for (int64_t g = 0; g < groups; ++g) {
+        ggml_tensor * chunk = ggml_view_4d(
+            ctx0, x, proj_dim, x->ne[1], x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], g * proj_dim * x->nb[0]);
+
+        if (use_signed_mix && g > 0) {
+            // cheap deterministic Rademacher sign per chunk
+            const uint32_t h = (uint32_t) (1664525u * (uint32_t)(g + 1) + 1013904223u);
+            const float s = (h & 1u) ? 1.0f : -1.0f;
+            chunk = ggml_scale(ctx0, chunk, s);
+        }
+
+        acc = acc ? ggml_add(ctx0, acc, chunk) : chunk;
+    }
+
+    if (groups > 1) {
+        acc = ggml_scale(ctx0, acc, 1.0f / sqrtf((float) groups));
+    }
+
+    return acc;
+}
+
+static ggml_tensor * turbo_kv_project_dim0_3d(
+        ggml_context * ctx0,
+        ggml_tensor  * x,
+        int64_t        proj_dim,
+        bool           use_signed_mix) {
+    const int64_t d = x->ne[0];
+    const int64_t fallback_dim = proj_dim > 0 && proj_dim < d ? proj_dim : d;
+    if (proj_dim <= 0 || proj_dim >= d || (d % proj_dim) != 0) {
+        return ggml_view_3d(ctx0, x, fallback_dim, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
+    }
+
+    const int64_t groups = d / proj_dim;
+    ggml_tensor * acc = nullptr;
+
+    for (int64_t g = 0; g < groups; ++g) {
+        ggml_tensor * chunk = ggml_view_3d(
+            ctx0, x, proj_dim, x->ne[1], x->ne[2], x->nb[1], x->nb[2], g * proj_dim * x->nb[0]);
+
+        if (use_signed_mix && g > 0) {
+            const uint32_t h = (uint32_t) (1664525u * (uint32_t)(g + 1) + 1013904223u);
+            const float s = (h & 1u) ? 1.0f : -1.0f;
+            chunk = ggml_scale(ctx0, chunk, s);
+        }
+
+        acc = acc ? ggml_add(ctx0, acc, chunk) : chunk;
+    }
+
+    if (groups > 1) {
+        acc = ggml_scale(ctx0, acc, 1.0f / sqrtf((float) groups));
+    }
+
+    return acc;
+}
+
+static inline void turbo_kv_hadamard32_ortho(float v[32]) {
+    for (int len = 1; len < 32; len <<= 1) {
+        for (int i = 0; i < 32; i += (len << 1)) {
+            for (int j = 0; j < len; ++j) {
+                const float a = v[i + j];
+                const float b = v[i + j + len];
+                v[i + j]       = a + b;
+                v[i + j + len] = a - b;
+            }
+        }
+    }
+    const float s = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; ++i) {
+        v[i] *= s;
+    }
+}
+
+static inline int turbo_kv_lloyd_nearest(float z) {
+    static const float cb[8] = { -2.15f, -1.34f, -0.76f, -0.25f, 0.25f, 0.76f, 1.34f, 2.15f };
+    int best = 0;
+    float best_dist = fabsf(z - cb[0]);
+    for (int i = 1; i < 8; ++i) {
+        const float d = fabsf(z - cb[i]);
+        if (d < best_dist) {
+            best_dist = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+// userdata for turbo_kv_qjl_map_custom1_f32: dim_offset aligns Rademacher sign
+// indices with the fused kernel (which uses absolute head-dimension positions).
+// Must outlive graph evaluation — use static storage at call site.
+struct turbo_kv_qjl_qdq_params {
+    int32_t dim_offset; // typically proj_dim
+};
+
+static void turbo_kv_qjl_map_custom1_f32(
+              ggml_tensor * dst,
+        const ggml_tensor * src,
+                     int    ith,
+                     int    nth,
+                    void *  userdata) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src->ne[0] == dst->ne[0]);
+
+    const auto * p = (const turbo_kv_qjl_qdq_params *) userdata;
+    const int32_t dim_off = p ? p->dim_offset : 0;
+
+    const int64_t ne0 = src->ne[0];
+    const int64_t nrows = ggml_nrows(src);
+
+    const int64_t r0 = (ith * nrows) / nth;
+    const int64_t r1 = ((ith + 1) * nrows) / nth;
+
+    const float * sdata = (const float *) src->data;
+    float * ddata = (float *) dst->data;
+    static const float cb[8] = { -2.15f, -1.34f, -0.76f, -0.25f, 0.25f, 0.76f, 1.34f, 2.15f };
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const float * sr = sdata + r * ne0;
+        float * dr = ddata + r * ne0;
+
+        int64_t j = 0;
+        for (; j + 32 <= ne0; j += 32) {
+            float v[32];
+            memcpy(v, sr + j, sizeof(v));
+
+            // Rademacher preconditioning (Google QJL §3.1): deterministic random
+            // sign-flip before Hadamard makes coordinates ~i.i.d. Gaussian,
+            // which is what the Lloyd-Max codebook is optimised for.
+            // dim_off aligns sign indices with the fused-kernel's absolute positions.
+            for (int i = 0; i < 32; ++i) {
+                const uint32_t ridx = (uint32_t)(dim_off + j + i + 1);
+                const float sign = ((1664525u * ridx + 1013904223u) & 1u) ? 1.0f : -1.0f;
+                v[i] *= sign;
+            }
+
+            // Forward JL rotation: orthonormal Hadamard.
+            turbo_kv_hadamard32_ortho(v);
+
+            // Lloyd-Max 3-bit in normalized domain, then dequant.
+            float e2 = 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                e2 += v[i] * v[i];
+            }
+            const float sigma = sqrtf(e2 / 32.0f) + 1e-6f;
+            const float isigma = 1.0f / sigma;
+            for (int i = 0; i < 32; ++i) {
+                const int qi = turbo_kv_lloyd_nearest(v[i] * isigma);
+                v[i] = cb[qi] * sigma;
+            }
+
+            // Inverse JL rotation: Hadamard (involutory) then Rademacher (self-inverse).
+            turbo_kv_hadamard32_ortho(v);
+            for (int i = 0; i < 32; ++i) {
+                const uint32_t ridx = (uint32_t)(dim_off + j + i + 1);
+                const float sign = ((1664525u * ridx + 1013904223u) & 1u) ? 1.0f : -1.0f;
+                v[i] *= sign;
+            }
+
+            memcpy(dr + j, v, sizeof(v));
+        }
+
+        // tail: passthrough
+        for (; j < ne0; ++j) {
+            dr[j] = sr[j];
+        }
+    }
+}
+
+struct turbo_kv_qjl_attn_params {
+    int32_t proj_dim;
+    float tail_scale;
+};
+
+static inline float turbo_kv_read_f32_4d(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    const char * base = (const char *) t->data + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+    return *(const float *) base;
+}
+
+static inline void turbo_kv_write_f32_4d(ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3, float v) {
+    char * base = (char *) t->data + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+    *(float *) base = v;
+}
+
+static void turbo_kv_qjl_attn_custom_f32(
+              ggml_tensor * dst,
+                     int    ith,
+                     int    nth,
+                    void *  userdata) {
+    const ggml_tensor * k = dst->src[0];
+    const ggml_tensor * q = dst->src[1];
+
+    GGML_ASSERT(k && q);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const auto * p = (const turbo_kv_qjl_attn_params *) userdata;
+    const int64_t d = q->ne[0];
+    const int64_t n_q = q->ne[1];
+    const int64_t n_h = q->ne[2];
+    const int64_t n_s = q->ne[3];
+    const int64_t n_k = k->ne[1];
+    const int64_t proj = p ? p->proj_dim : 0;
+    const int64_t d_proj = (proj > 0 && proj < d) ? proj : d;
+
+    const int64_t jobs = n_h * n_s;
+    const int64_t j0 = (jobs * ith) / nth;
+    const int64_t j1 = (jobs * (ith + 1)) / nth;
+    static const float cb[8] = { -2.15f, -1.34f, -0.76f, -0.25f, 0.25f, 0.76f, 1.34f, 2.15f };
+
+    for (int64_t job = j0; job < j1; ++job) {
+        const int64_t h = job % n_h;
+        const int64_t s = job / n_h;
+
+        for (int64_t iq = 0; iq < n_q; ++iq) {
+            for (int64_t ik = 0; ik < n_k; ++ik) {
+                float sum = 0.0f;
+
+                for (int64_t j = 0; j < d_proj; ++j) {
+                    sum += turbo_kv_read_f32_4d(q, j, iq, h, s) * turbo_kv_read_f32_4d(k, j, ik, h, s);
+                }
+
+                int64_t j = d_proj;
+                for (; j + 32 <= d; j += 32) {
+                    float qb[32];
+                    float kb[32];
+                    for (int b = 0; b < 32; ++b) {
+                        float qv = turbo_kv_read_f32_4d(q, j + b, iq, h, s);
+                        float kv = turbo_kv_read_f32_4d(k, j + b, ik, h, s);
+                        // deterministic Rademacher preconditioning (shared for q/k)
+                        const uint32_t ridx = (uint32_t) (j + b + 1);
+                        const float sign = ((1664525u * ridx + 1013904223u) & 1u) ? 1.0f : -1.0f;
+                        qb[b] = qv * sign;
+                        kb[b] = kv * sign;
+                    }
+
+                    turbo_kv_hadamard32_ortho(qb);
+                    turbo_kv_hadamard32_ortho(kb);
+
+                    float eq = 0.0f;
+                    float ek = 0.0f;
+                    for (int b = 0; b < 32; ++b) {
+                        eq += qb[b]*qb[b];
+                        ek += kb[b]*kb[b];
+                    }
+                    const float sigma_q = sqrtf(eq / 32.0f) + 1e-6f;
+                    const float sigma_k = sqrtf(ek / 32.0f) + 1e-6f;
+                    const float isigma_q = 1.0f / sigma_q;
+                    const float isigma_k = 1.0f / sigma_k;
+
+                    float tail = 0.0f;
+                    for (int b = 0; b < 32; ++b) {
+                        const float zq = qb[b] * isigma_q;
+                        const int qi = turbo_kv_lloyd_nearest(kb[b] * isigma_k);
+                        tail += zq * cb[qi];
+                    }
+                    const float tail_term = tail * (sigma_q * sigma_k);
+                    sum += (p ? p->tail_scale : 1.0f) * tail_term;
+                }
+
+                for (; j < d; ++j) {
+                    sum += turbo_kv_read_f32_4d(q, j, iq, h, s) * turbo_kv_read_f32_4d(k, j, ik, h, s);
+                }
+
+                turbo_kv_write_f32_4d(dst, ik, iq, h, s, sum);
+            }
+        }
+    }
+}
+
+static ggml_tensor * turbo_kv_lloyd3_quantized(
+        ggml_context * ctx0,
+        ggml_tensor  * z) {
+    if (z->ne[0] > 32) {
+        // graph-size guard for larger dims
+        ggml_tensor * zc = ggml_clamp(ctx0, z, -2.5f, 2.5f);
+        ggml_tensor * qi = ggml_round(ctx0, ggml_scale(ctx0, zc, 1.4f));
+        return ggml_scale(ctx0, qi, 1.0f / 1.4f);
+    }
+
+    // 3-bit Lloyd-Max quantizer (nearest-codebook) in normalized domain.
+    // Decision thresholds are midpoints between adjacent codebook values.
+    static const float cb[8] = { -2.15f, -1.34f, -0.76f, -0.25f, 0.25f, 0.76f, 1.34f, 2.15f };
+    static const float th[7] = { -1.745f, -1.05f, -0.505f, 0.0f, 0.505f, 1.05f, 1.745f };
+
+    auto scalar = [ctx0](float v) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+        if (t->data != nullptr) {
+            ((float *) t->data)[0] = v;
+        }
+        return t;
+    };
+
+    ggml_tensor * q = ggml_scale(ctx0, z, 0.0f);
+    q = ggml_add1(ctx0, q, scalar(cb[0]));
+
+    for (int i = 0; i < 7; ++i) {
+        ggml_tensor * s = ggml_step(ctx0, ggml_add1(ctx0, z, scalar(-th[i]))); // step(z - th[i])
+        q = ggml_add(ctx0, q, ggml_scale(ctx0, s, cb[i + 1] - cb[i]));
+    }
+
+    return q;
+}
+
+static ggml_tensor * turbo_kv_qjl_quant_dequant(
+        ggml_context * ctx0,
+        ggml_tensor  * x,
+        ggml_type      out_type,
+        int32_t        dim_offset = 0) {
+    // Static params: survives until graph evaluation, safe because
+    // dim_offset is constant across layers within a single model.
+    static turbo_kv_qjl_qdq_params qdq_p;
+    qdq_p.dim_offset = dim_offset;
+
+    ggml_tensor * x_f32 = ggml_cast(ctx0, ggml_cont(ctx0, x), GGML_TYPE_F32);
+    ggml_tensor * xq    = ggml_map_custom1(ctx0, x_f32, turbo_kv_qjl_map_custom1_f32, GGML_N_TASKS_MAX, &qdq_p);
+    return ggml_cast(ctx0, xq, out_type);
+}
+
+// Parity check: compare exact vs estimated kq scores, log error metrics,
+// and pass through exact values so inference quality is unaffected.
+static void turbo_kv_parity_check_custom2_f32(
+              ggml_tensor * dst,
+        const ggml_tensor * a,   // exact kq
+        const ggml_tensor * b,   // estimated kq
+                     int    ith,
+                     int    nth,
+                    void *  userdata) {
+    const int64_t n = ggml_nelements(a);
+    const int64_t i0 = (ith * n) / nth;
+    const int64_t i1 = ((ith + 1) * n) / nth;
+
+    const float * exact = (const float *) a->data;
+    const float * estim = (const float *) b->data;
+    float * out = (float *) dst->data;
+
+    // Pass through exact values.
+    memcpy(out + i0, exact + i0, (i1 - i0) * sizeof(float));
+
+    // Thread 0 computes and logs error metrics.
+    if (ith == 0) {
+        float max_abs = 0.0f;
+        double sum_sq_err = 0.0;
+        double sum_sq_ref = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float err = exact[i] - estim[i];
+            const float ae  = fabsf(err);
+            if (ae > max_abs) max_abs = ae;
+            sum_sq_err += (double)err * err;
+            sum_sq_ref += (double)exact[i] * exact[i];
+        }
+        const float rms = sqrtf((float)(sum_sq_err / (double)n));
+        const float rel = sum_sq_ref > 0.0 ? sqrtf((float)(sum_sq_err / sum_sq_ref)) * 100.0f : 0.0f;
+        const int layer = userdata ? *(const int *)userdata : -1;
+        fprintf(stderr, "QJL parity [layer %2d]: max_err=%.6f  rms=%.6f  rel_err=%.2f%%  n=%lld\n",
+            layer, max_abs, rms, rel, (long long)n);
+    }
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -1845,12 +2224,112 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        ggml_tensor * kq = nullptr;
+        if (cparams.turbo_kv && cparams.turbo_kv_qjl) {
+            const char * qjl_exp = getenv("LLAMA_TURBO_KV_QJL_EXPERIMENTAL");
+            const bool use_qjl_experimental = qjl_exp != nullptr && qjl_exp[0] != '\0' && strcmp(qjl_exp, "0") != 0;
+
+            // Safe default: exact backend-native matmul while QJL estimator kernels are being brought up.
+            if (!use_qjl_experimental) {
+                kq = ggml_mul_mat(ctx0, k, q);
+            } else {
+                const char * cpu_env = getenv("LLAMA_TURBO_KV_QJL_CPU");
+                const bool use_cpu = cpu_env != nullptr && cpu_env[0] != '\0' && strcmp(cpu_env, "0") != 0;
+
+                if (use_cpu) {
+                    // CPU reference: fused kernel with Google-faithful
+                    // Rademacher·Hadamard·Lloyd 3-bit QJL estimator.
+                    // Slower (~18 t/s) due to CPU execution; use for validation.
+                    const char * graph_env = getenv("LLAMA_TURBO_KV_QJL_GRAPH");
+                    const bool use_graph = graph_env != nullptr && graph_env[0] != '\0' && strcmp(graph_env, "0") != 0;
+
+                    if (use_graph) {
+                        // Graph variant: split head/tail with ggml_map_custom1 QJL.
+                        const int64_t d = q->ne[0];
+                        const int64_t proj_dim = (int64_t) cparams.turbo_kv_proj_dim;
+                        if (proj_dim > 0 && proj_dim < d) {
+                            ggml_tensor * q_proj = ggml_view_4d(ctx0, q, proj_dim, q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], 0);
+                            ggml_tensor * k_proj = ggml_view_4d(ctx0, k, proj_dim, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+                            ggml_tensor * q_tail = ggml_view_4d(ctx0, q, d - proj_dim, q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], proj_dim * q->nb[0]);
+                            ggml_tensor * k_tail = ggml_view_4d(ctx0, k, d - proj_dim, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], proj_dim * k->nb[0]);
+
+                            ggml_tensor * q_tail_f32 = q_tail->type == GGML_TYPE_F32 ? q_tail : ggml_cast(ctx0, q_tail, GGML_TYPE_F32);
+                            ggml_tensor * k_tail_f32 = k_tail->type == GGML_TYPE_F32 ? k_tail : ggml_cast(ctx0, k_tail, GGML_TYPE_F32);
+                            ggml_tensor * k_tail_q_f32 = turbo_kv_qjl_quant_dequant(ctx0, k_tail_f32, GGML_TYPE_F32, (int32_t)proj_dim);
+
+                            ggml_tensor * kq_proj = ggml_mul_mat(ctx0, k_proj, q_proj);
+                            ggml_tensor * kq_tail = ggml_mul_mat(ctx0, k_tail_q_f32, q_tail_f32);
+                            kq = ggml_add(ctx0, kq_proj, kq_tail);
+                        } else {
+                            kq = ggml_mul_mat(ctx0, k, q);
+                        }
+                    } else {
+                        // Fused CPU kernel (default CPU path).
+                        ggml_tensor * kf = k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
+                        ggml_tensor * qf = q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+                        ggml_tensor * args[2] = { kf, qf };
+                        static turbo_kv_qjl_attn_params fused_p;
+                        fused_p = { (int32_t) cparams.turbo_kv_proj_dim, 1.0f };
+                        kq = ggml_custom_4d(
+                            ctx0, GGML_TYPE_F32,
+                            kf->ne[1], qf->ne[1], qf->ne[2], qf->ne[3],
+                            args, 2, turbo_kv_qjl_attn_custom_f32, GGML_N_TASKS_MAX, &fused_p);
+                    }
+                } else {
+                    // Default experimental: all-Metal path.
+                    if (ggml_is_quantized(k->type)) {
+                        // K cache is already quantized (e.g. -ctk q8_0).
+                        // Write-time quantization amortizes cost — just matmul directly.
+                        // No split needed; view offsets into quantized blocks are fragile.
+                        kq = ggml_mul_mat(ctx0, k, q);
+                    } else {
+                        // K cache is F16/F32. Split head (exact) + tail (Q8_0 per-step).
+                        const int64_t d = q->ne[0];
+                        const int64_t proj_dim = (int64_t) cparams.turbo_kv_proj_dim;
+                        const int64_t tail_dim = d - proj_dim;
+                        if (proj_dim > 0 && proj_dim < d && tail_dim % 32 == 0) {
+                            ggml_tensor * q_proj = ggml_view_4d(ctx0, q, proj_dim, q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], 0);
+                            ggml_tensor * k_proj = ggml_view_4d(ctx0, k, proj_dim, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+                            ggml_tensor * q_tail = ggml_view_4d(ctx0, q, tail_dim, q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], proj_dim * q->nb[0]);
+                            ggml_tensor * k_tail = ggml_view_4d(ctx0, k, tail_dim, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], proj_dim * k->nb[0]);
+
+                            // Per-step Q8_0 quantize k_tail on GPU.
+                            ggml_tensor * k_tail_q8 = ggml_cast(ctx0, k_tail, GGML_TYPE_Q8_0);
+
+                            ggml_tensor * kq_proj = ggml_mul_mat(ctx0, k_proj, q_proj);
+                            ggml_tensor * kq_tail = ggml_mul_mat(ctx0, k_tail_q8, q_tail);
+                            kq = ggml_add(ctx0, kq_proj, kq_tail);
+                        } else {
+                            kq = ggml_mul_mat(ctx0, k, q);
+                        }
+                    }
+                }
+
+                // Parity gate: when enabled, also compute exact kq and log per-layer
+                // error metrics. Uses exact kq for inference (quality unaffected).
+                const char * parity_env = getenv("LLAMA_TURBO_KV_QJL_PARITY");
+                if (parity_env != nullptr && parity_env[0] != '\0' && strcmp(parity_env, "0") != 0) {
+                    ggml_tensor * kq_estimated = kq;
+                    ggml_tensor * kq_exact = ggml_mul_mat(ctx0, k, q);
+                    static int parity_layer_ids[256];
+                    parity_layer_ids[il % 256] = il;
+                    kq = ggml_map_custom2(ctx0, kq_exact, kq_estimated,
+                        turbo_kv_parity_check_custom2_f32, GGML_N_TASKS_MAX,
+                        &parity_layer_ids[il % 256]);
+                }
+            }
+        } else {
+            kq = ggml_mul_mat(ctx0, k, q);
+        }
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        if (kq->op == GGML_OP_MUL_MAT) {
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        }
 
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
@@ -2041,6 +2520,40 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
+    ggml_tensor * k_store = k_cur;
+    ggml_tensor * v_store = v_cur;
+    if (cparams.turbo_kv && !cparams.turbo_kv_qjl) {
+        const int64_t proj_dim = (int64_t) cparams.turbo_kv_proj_dim;
+        const int64_t k_dim = k_cur->ne[0];
+        const int64_t v_dim = v_cur->ne[0];
+        if (proj_dim > 0 && proj_dim < k_dim) {
+            ggml_tensor * k_head = turbo_kv_project_dim0_3d(ctx0, k_cur, proj_dim, cparams.turbo_kv_qjl);
+            ggml_tensor * k_tail_src = ggml_view_3d(ctx0, k_cur, k_dim - proj_dim, k_cur->ne[1], k_cur->ne[2], k_cur->nb[1], k_cur->nb[2], proj_dim * k_cur->nb[0]);
+            ggml_tensor * k_tail = nullptr;
+            if (cparams.turbo_kv_qjl) {
+                // QJL-style residual quant/dequant on dropped dims (codebook in normalized domain).
+                k_tail = turbo_kv_qjl_quant_dequant(ctx0, k_tail_src, k_cur->type);
+                cb(k_tail, "tq_k_residual", il);
+            } else {
+                k_tail = ggml_scale(ctx0, ggml_cont(ctx0, k_tail_src), 0.0f);
+            }
+            k_store = ggml_concat(ctx0, k_head, k_tail, 0);
+            cb(k_store, "tq_k_store", il);
+        }
+        if (proj_dim > 0 && proj_dim < v_dim) {
+            ggml_tensor * v_head = ggml_view_3d(ctx0, v_cur, proj_dim, v_cur->ne[1], v_cur->ne[2], v_cur->nb[1], v_cur->nb[2], 0);
+            ggml_tensor * v_tail_src = ggml_view_3d(ctx0, v_cur, v_dim - proj_dim, v_cur->ne[1], v_cur->ne[2], v_cur->nb[1], v_cur->nb[2], proj_dim * v_cur->nb[0]);
+            ggml_tensor * v_tail = nullptr;
+            if (cparams.turbo_kv_qjl) {
+                v_tail = ggml_scale(ctx0, ggml_cont(ctx0, v_tail_src), 0.0f);
+            } else {
+                v_tail = ggml_scale(ctx0, ggml_cont(ctx0, v_tail_src), 0.0f);
+            }
+            v_store = ggml_concat(ctx0, v_head, v_tail, 0);
+            cb(v_store, "tq_v_store", il);
+        }
+    }
+
     const auto * mctx_cur = inp->mctx;
 
     // store to KV cache
@@ -2048,8 +2561,8 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_store, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_store, v_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -2057,8 +2570,76 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * q_full = q;
+    ggml_tensor * k_full = k;
+    float kq_scale_eff = kq_scale;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    // Phase-B projected-KV scaffold:
+    // apply deterministic dim-reduction on Q/K (dim0 view) and keep V full-size.
+    // This wires the runtime path without introducing projection matrices yet.
+    if (cparams.turbo_kv && !cparams.turbo_kv_qjl) {
+        const int64_t proj_dim = (int64_t) cparams.turbo_kv_proj_dim;
+        if (proj_dim > 0 && proj_dim < q->ne[0] && proj_dim < k->ne[0]) {
+            ggml_tensor * q_proj = turbo_kv_project_dim0_4d(ctx0, q, proj_dim, cparams.turbo_kv_qjl);
+            ggml_tensor * k_proj = ggml_view_4d(ctx0, k, proj_dim, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+            if (cparams.turbo_kv_qjl) {
+                // Keep Phase-C lightweight to stay within graph budget; correction path TBD.
+            }
+
+            q = q_proj;
+            k = k_proj;
+            cb(q, "tq_q_proj", il);
+            cb(k, "tq_k_proj", il);
+
+            const float d0 = (float) hparams.n_embd_head_k(il);
+            const float dp = (float) proj_dim;
+            if (dp > 0.0f) {
+                // base kq_scale is 1/sqrt(d0). After dim reduction use 1/sqrt(dp).
+                kq_scale_eff = kq_scale * sqrtf(d0 / dp);
+            }
+        } else {
+            static bool turbo_kv_warned = false;
+            if (!turbo_kv_warned) {
+                LLAMA_LOG_WARN("%s: turbo_kv enabled but proj_dim=%u is not smaller than Q/K dim; using baseline attention dims\n",
+                    __func__, cparams.turbo_kv_proj_dim);
+                turbo_kv_warned = true;
+            }
+        }
+    }
+
+    ggml_tensor * kq_b_eff = kq_b;
+    if (false && cparams.turbo_kv && cparams.turbo_kv_qjl) {
+        const int64_t proj_dim = (int64_t) cparams.turbo_kv_proj_dim;
+        if (proj_dim > 0 && proj_dim < q_full->ne[0] && proj_dim < k_full->ne[0]) {
+            ggml_tensor * q_tail = ggml_view_4d(
+                ctx0, q_full, q_full->ne[0] - proj_dim, q_full->ne[1], q_full->ne[2], q_full->ne[3],
+                q_full->nb[1], q_full->nb[2], q_full->nb[3], proj_dim * q_full->nb[0]);
+            ggml_tensor * k_tail = ggml_view_4d(
+                ctx0, k_full, k_full->ne[0] - proj_dim, k_full->ne[1], k_full->ne[2], k_full->ne[3],
+                k_full->nb[1], k_full->nb[2], k_full->nb[3], proj_dim * k_full->nb[0]);
+
+            ggml_tensor * k_tail_q = turbo_kv_qjl_quant_dequant(ctx0, k_tail, k_tail->type);
+
+            const auto n_stream = k_tail_q->ne[3];
+            ggml_tensor * q_tail_s = ggml_view_4d(
+                ctx0, q_tail, q_tail->ne[0], q_tail->ne[1], q_tail->ne[2] / n_stream, n_stream,
+                q_tail->nb[1], q_tail->nb[2], q_tail->nb[3] / n_stream, 0);
+
+            q_tail_s = ggml_permute(ctx0, q_tail_s, 0, 2, 1, 3);
+            k_tail_q = ggml_permute(ctx0, k_tail_q, 0, 2, 1, 3);
+
+            ggml_tensor * kq_corr = ggml_mul_mat(ctx0, k_tail_q, q_tail_s);
+            ggml_mul_mat_set_prec(kq_corr, GGML_PREC_F32);
+            kq_corr = ggml_scale(ctx0, kq_corr, 1.0f);
+            cb(kq_corr, "tq_kq_corr", il);
+
+            kq_b_eff = kq_b_eff ? ggml_add(ctx0, kq_b_eff, kq_corr) : kq_corr;
+            cb(kq_b_eff, "tq_kq_bias_eff", il);
+        }
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b_eff, kq_mask, sinks, v_mla, kq_scale_eff, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {

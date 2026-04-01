@@ -162,6 +162,9 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.turbo_kv = params.turbo_kv;
+    cparams.turbo_kv_qjl = params.turbo_kv_qjl;
+    cparams.turbo_kv_proj_dim = params.turbo_kv_proj_dim;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -202,6 +205,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: turbo_kv      = %s\n",   __func__, cparams.turbo_kv ? "true" : "false");
+    LLAMA_LOG_INFO("%s: turbo_kv_qjl  = %s\n",   __func__, cparams.turbo_kv_qjl ? "true" : "false");
+    LLAMA_LOG_INFO("%s: turbo_kv_dim  = %u\n",   __func__, cparams.turbo_kv_proj_dim);
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
@@ -2904,6 +2910,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.turbo_kv_proj_dim           =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -2912,6 +2919,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.turbo_kv                    =*/ false,
+        /*.turbo_kv_qjl                =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -2937,8 +2946,51 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (params.turbo_kv_qjl && !params.turbo_kv) {
+        LLAMA_LOG_ERROR("%s: turbo_kv_qjl requires turbo_kv\n", __func__);
+        return nullptr;
+    }
+
+    if (params.turbo_kv && params.turbo_kv_proj_dim == 0) {
+        LLAMA_LOG_ERROR("%s: turbo_kv requires turbo_kv_proj_dim > 0\n", __func__);
+        return nullptr;
+    }
+
+    if (params.turbo_kv && params.type_v != GGML_TYPE_F16 && !ggml_is_quantized(params.type_v)) {
+        LLAMA_LOG_ERROR("%s: turbo_kv requires f16 or quantized V cache (got V=%s)\n",
+            __func__, ggml_type_name(params.type_v));
+        return nullptr;
+    }
+    if (params.turbo_kv && params.type_k != GGML_TYPE_F16 && !ggml_is_quantized(params.type_k)) {
+        LLAMA_LOG_ERROR("%s: turbo_kv requires f16 or quantized K cache (got K=%s)\n",
+            __func__, ggml_type_name(params.type_k));
+        return nullptr;
+    }
+
+    if (params.turbo_kv) {
+        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+            if (params.turbo_kv_proj_dim > model->hparams.n_embd_head_k(il)) {
+                LLAMA_LOG_ERROR("%s: turbo_kv_proj_dim=%u exceeds n_embd_head_k=%u at layer %u\n",
+                    __func__, params.turbo_kv_proj_dim, model->hparams.n_embd_head_k(il), il);
+                return nullptr;
+            }
+            if (params.turbo_kv_proj_dim > model->hparams.n_embd_head_v(il)) {
+                LLAMA_LOG_ERROR("%s: turbo_kv_proj_dim=%u exceeds n_embd_head_v=%u at layer %u\n",
+                    __func__, params.turbo_kv_proj_dim, model->hparams.n_embd_head_v(il), il);
+                return nullptr;
+            }
+        }
+        LLAMA_LOG_WARN("%s: turbo_kv enabled (experimental), proj_dim=%u, qjl=%s\n",
+            __func__, params.turbo_kv_proj_dim, params.turbo_kv_qjl ? "on" : "off");
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
+    if (params.turbo_kv && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        LLAMA_LOG_WARN("%s: turbo_kv keeps flash_attn disabled until projected-KV Metal FA kernels are fully integrated\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
