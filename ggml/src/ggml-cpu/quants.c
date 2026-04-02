@@ -22,6 +22,19 @@
 
 #define UNUSED GGML_UNUSED
 
+static inline int ggml_tq3s_env_enabled(const char * name) {
+    const char * val = getenv(name);
+    return val != NULL && val[0] != '\0' && strcmp(val, "0") != 0;
+}
+
+static inline int ggml_tq3s_exp_mode_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ggml_tq3s_env_enabled("GGML_TQ3S_HADAMARD") || ggml_tq3s_env_enabled("GGML_TQ3S_LLOYD");
+    }
+    return cached;
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -1326,6 +1339,18 @@ void ggml_vec_dot_tq3_s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const int nb = n / QK_TQ3_S;
     float sumf = 0.0f;
+    if (ggml_tq3s_exp_mode_enabled()) {
+        for (int i = 0; i < nb; ++i) {
+            float xv[QK_TQ3_S];
+            dequantize_row_tq3_s(x + i, xv, QK_TQ3_S);
+            const float yd = GGML_CPU_FP16_TO_FP32(y[i].d);
+            for (int j = 0; j < QK_TQ3_S; ++j) {
+                sumf += xv[j] * ((float) y[i].qs[j] * yd);
+            }
+        }
+        *s = sumf;
+        return;
+    }
 
     for (int i = 0; i < nb; ++i) {
         int32_t isum = 0;

@@ -1470,6 +1470,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.turbo_kv_proj_dim = params.turbo_kv_proj_dim;
+    cparams.turbo_kv = params.turbo_kv;
+    cparams.turbo_kv_qjl = params.turbo_kv_qjl;
 
     return cparams;
 }

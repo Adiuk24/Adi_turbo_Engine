@@ -19,6 +19,58 @@
 
 #define UNUSED GGML_UNUSED
 
+static inline int ggml_tq3s_env_enabled(const char * name) {
+    const char * val = getenv(name);
+    return val != NULL && val[0] != '\0' && strcmp(val, "0") != 0;
+}
+
+static inline int ggml_tq3s_use_hadamard(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ggml_tq3s_env_enabled("GGML_TQ3S_HADAMARD");
+    }
+    return cached;
+}
+
+static inline int ggml_tq3s_use_lloyd(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ggml_tq3s_env_enabled("GGML_TQ3S_LLOYD");
+    }
+    return cached;
+}
+
+static inline void ggml_tq3s_hadamard32_ortho(float v[QK_TQ3_S]) {
+    for (int len = 1; len < QK_TQ3_S; len <<= 1) {
+        for (int i = 0; i < QK_TQ3_S; i += (len << 1)) {
+            for (int j = 0; j < len; ++j) {
+                const float a = v[i + j];
+                const float b = v[i + j + len];
+                v[i + j]       = a + b;
+                v[i + j + len] = a - b;
+            }
+        }
+    }
+    const float s = 1.0f / sqrtf((float) QK_TQ3_S);
+    for (int i = 0; i < QK_TQ3_S; ++i) {
+        v[i] *= s;
+    }
+}
+
+static inline int ggml_tq3s_lloyd_nearest(float z) {
+    static const float cb[8] = { -2.15f, -1.34f, -0.76f, -0.25f, 0.25f, 0.76f, 1.34f, 2.15f };
+    int best = 0;
+    float best_dist = fabsf(z - cb[0]);
+    for (int i = 1; i < 8; ++i) {
+        const float dist = fabsf(z - cb[i]);
+        if (dist < best_dist) {
+            best = i;
+            best_dist = dist;
+        }
+    }
+    return best;
+}
+
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
@@ -2628,27 +2680,56 @@ void dequantize_row_tq4_0(const block_tq4_0 * GGML_RESTRICT x, float * GGML_REST
 void quantize_row_tq3_s_ref(const float * GGML_RESTRICT x, block_tq3_s * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TQ3_S == 0);
     const int64_t nb = k / QK_TQ3_S;
+    const int use_hadamard = ggml_tq3s_use_hadamard();
+    const int use_lloyd = ggml_tq3s_use_lloyd();
 
     for (int64_t i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        for (int j = 0; j < QK_TQ3_S; j++) {
-            amax = MAX(amax, fabsf(x[j]));
+        float xb[QK_TQ3_S];
+        memcpy(xb, x, sizeof(xb));
+        if (use_hadamard) {
+            ggml_tq3s_hadamard32_ortho(xb);
         }
-
-        const float d = amax / 4.0f;
-        const float id = d ? 1.0f/d : 0.0f;
-
-        y[i].d = GGML_FP32_TO_FP16(d);
-
-        for (int j = 0; j < QK_TQ3_S/8; j++) {
-            uint32_t p = 0;
-            for (int m = 0; m < 8; m++) {
-                int xi = MIN(7, MAX(0, (int)lroundf(x[8*j + m]*id + 4.0f)));
-                p |= (uint32_t)xi << (3*m);
+        if (use_lloyd) {
+            float e2 = 0.0f;
+            for (int j = 0; j < QK_TQ3_S; ++j) {
+                e2 += xb[j]*xb[j];
             }
-            y[i].qs[3*j + 0] = (p >>  0) & 0xFF;
-            y[i].qs[3*j + 1] = (p >>  8) & 0xFF;
-            y[i].qs[3*j + 2] = (p >> 16) & 0xFF;
+            const float sigma = sqrtf(e2 / (float) QK_TQ3_S) + 1e-12f;
+            const float isigma = 1.0f / sigma;
+            y[i].d = GGML_FP32_TO_FP16(sigma);
+
+            for (int j = 0; j < QK_TQ3_S/8; ++j) {
+                uint32_t p = 0;
+                for (int m = 0; m < 8; ++m) {
+                    const float z = xb[8*j + m] * isigma;
+                    const int xi = ggml_tq3s_lloyd_nearest(z);
+                    p |= (uint32_t)xi << (3*m);
+                }
+                y[i].qs[3*j + 0] = (p >>  0) & 0xFF;
+                y[i].qs[3*j + 1] = (p >>  8) & 0xFF;
+                y[i].qs[3*j + 2] = (p >> 16) & 0xFF;
+            }
+        } else {
+            float amax = 0.0f;
+            for (int j = 0; j < QK_TQ3_S; j++) {
+                amax = MAX(amax, fabsf(xb[j]));
+            }
+
+            const float d = amax / 4.0f;
+            const float id = d ? 1.0f/d : 0.0f;
+
+            y[i].d = GGML_FP32_TO_FP16(d);
+
+            for (int j = 0; j < QK_TQ3_S/8; j++) {
+                uint32_t p = 0;
+                for (int m = 0; m < 8; m++) {
+                    int xi = MIN(7, MAX(0, (int)lroundf(xb[8*j + m]*id + 4.0f)));
+                    p |= (uint32_t)xi << (3*m);
+                }
+                y[i].qs[3*j + 0] = (p >>  0) & 0xFF;
+                y[i].qs[3*j + 1] = (p >>  8) & 0xFF;
+                y[i].qs[3*j + 2] = (p >> 16) & 0xFF;
+            }
         }
         x += QK_TQ3_S;
     }
@@ -2657,9 +2738,14 @@ void quantize_row_tq3_s_ref(const float * GGML_RESTRICT x, block_tq3_s * GGML_RE
 void dequantize_row_tq3_s(const block_tq3_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TQ3_S == 0);
     const int64_t nb = k / QK_TQ3_S;
+    const int use_hadamard = ggml_tq3s_use_hadamard();
+    const int use_lloyd = ggml_tq3s_use_lloyd();
+    static const float cb[8] = { -2.15f, -1.34f, -0.76f, -0.25f, 0.25f, 0.76f, 1.34f, 2.15f };
 
     for (int64_t i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
+        float xb[QK_TQ3_S];
+        int idx = 0;
 
         for (int j = 0; j < QK_TQ3_S/8; j++) {
             const uint32_t p = ((uint32_t)x[i].qs[3*j + 0] <<  0) |
@@ -2668,9 +2754,14 @@ void dequantize_row_tq3_s(const block_tq3_s * GGML_RESTRICT x, float * GGML_REST
 
             for (int m = 0; m < 8; m++) {
                 int xi = (p >> (3*m)) & 7;
-                *y++ = (float)(xi - 4.0f) * d;
+                xb[idx++] = use_lloyd ? cb[xi] * d : (float)(xi - 4.0f) * d;
             }
         }
+        if (use_hadamard) {
+            ggml_tq3s_hadamard32_ortho(xb);
+        }
+        memcpy(y, xb, sizeof(xb));
+        y += QK_TQ3_S;
     }
 }
 

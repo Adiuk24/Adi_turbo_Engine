@@ -548,6 +548,9 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    int32_t turbo_kv_proj_dim = 0;          // Turbo KV projected head dim, 0 = disabled
+    bool turbo_kv = false;                  // enable Turbo KV math path
+    bool turbo_kv_qjl = false;              // enable QJL residual correction path (requires turbo_kv)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

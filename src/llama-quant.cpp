@@ -494,8 +494,14 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         // Without this, MoE gate/attention tensors get flat ternary which destroys routing.
         // Mirrors the IQ2 logic below but uses Q4_K/Q5_K for sensitive tensors.
         if (category_is_attn_v(category)) {
-            if (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) new_type = GGML_TYPE_Q4_K;
-            else new_type = GGML_TYPE_Q3_K;
+            if (ftype == LLAMA_FTYPE_MOSTLY_TQ4_0) {
+                // Keep TQ4_0 attn_v at Q4_K for dense models to recover quality.
+                new_type = GGML_TYPE_Q4_K;
+            } else if (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) {
+                new_type = GGML_TYPE_Q4_K;
+            } else {
+                new_type = GGML_TYPE_Q3_K;
+            }
             ++qs.i_attention_wv;
         }
         else if (qs.model.hparams.n_expert >= 4 && category == tensor_category::ATTENTION_K) {
@@ -518,9 +524,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             if (tensor->ne[0] % 256 != 0) {
                 new_type = ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 ? GGML_TYPE_IQ2_XS : GGML_TYPE_IQ3_XXS;
             }
-            // First 1/8 of FFN_DOWN layers get higher precision
+            // First 1/8 of FFN_DOWN layers get higher precision.
             if (qs.i_ffn_down < qs.n_ffn_down/8) {
-                new_type = GGML_TYPE_Q3_K;
+                new_type = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K;
             }
             ++qs.i_ffn_down;
         }
@@ -1290,7 +1296,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 // When padding is active (2880->3072), the source data still has the
                 // original 2880 stride per row.  Compute the true source stride so that
                 // expert indexing reads from the correct offset in f32_data.
-                const bool     is_padded       = (n_per_row == 3072 && cur_type == GGML_TYPE_F32);
+                const bool     is_padded       = (n_per_row == 3072 && (cur_type == GGML_TYPE_F32 || cur_type == GGML_TYPE_BF16 || cur_type == GGML_TYPE_F16));
                 const int64_t  src_n_per_row   = is_padded ? 2880 : n_per_row;
                 const int64_t  src_elems_matrix = src_n_per_row * nrows;
 

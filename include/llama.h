@@ -356,6 +356,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        uint32_t turbo_kv_proj_dim; // projected KV head dim for Turbo KV math path, 0 = disabled
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -374,6 +375,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool turbo_kv;    // enable Turbo KV math path (projected-KV / QJL pipeline, when available)
+        bool turbo_kv_qjl;// enable QJL residual correction path (requires turbo_kv)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

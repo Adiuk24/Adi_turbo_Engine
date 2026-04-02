@@ -2064,6 +2064,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
            false) && (ne11 >= 4 && ne11 <= 8)
+         ) ||
+         (
+          (
+           op->src[0]->type == GGML_TYPE_TQ4_0 ||
+           op->src[0]->type == GGML_TYPE_TQ3_0 ||
+           op->src[0]->type == GGML_TYPE_TQ2_0 ||
+           op->src[0]->type == GGML_TYPE_TQ1_0 ||
+           false) && (ne11 >= 1 && ne11 <= 8)
          )
         )
        ) {
@@ -2093,6 +2101,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         // note: not sure how optimal are those across all different hardware. there might be something cleverer
         switch (ne11) {
+            case 1:
             case 2:
                 r1ptg = 2; break;
             case 3:

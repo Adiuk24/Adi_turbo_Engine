@@ -2022,6 +2022,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--turbo-kv"},
+        string_format("enable Turbo KV projected-math path (default: %s)", params.turbo_kv ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.turbo_kv = true;
+        }
+    ).set_env("LLAMA_ARG_TURBO_KV"));
+    add_opt(common_arg(
+        {"--turbo-kv-proj-dim"}, "N",
+        string_format("Turbo KV projected head dimension (default: %d, 0 disables Turbo KV)", params.turbo_kv_proj_dim),
+        [](common_params & params, int value) {
+            params.turbo_kv_proj_dim = value;
+        }
+    ).set_env("LLAMA_ARG_TURBO_KV_PROJ_DIM"));
+    add_opt(common_arg(
+        {"--turbo-kv-qjl"},
+        string_format("enable Turbo KV QJL residual correction path (default: %s)", params.turbo_kv_qjl ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.turbo_kv_qjl = true;
+        }
+    ).set_env("LLAMA_ARG_TURBO_KV_QJL"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
