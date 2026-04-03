@@ -334,6 +334,9 @@ struct cmd_params {
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<bool>                flash_attn;
+    std::vector<bool>                turbo_kv;
+    std::vector<bool>                turbo_kv_qjl;
+    std::vector<int>                 turbo_kv_proj_dim;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
@@ -376,6 +379,9 @@ static const cmd_params cmd_params_defaults = {
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { false },
+    /* turbo_kv             */ { false },
+    /* turbo_kv_qjl         */ { false },
+    /* turbo_kv_proj_dim    */ { 64 },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
@@ -442,6 +448,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <0|1>                     (default: %s)\n", join(cmd_params_defaults.flash_attn, ",").c_str());
+    printf("  --turbo-kv                                  enable turbo-kv runtime path (default: %s)\n", join(cmd_params_defaults.turbo_kv, ",").c_str());
+    printf("  --turbo-kv-qjl                              enable turbo-kv QJL mode (default: %s)\n", join(cmd_params_defaults.turbo_kv_qjl, ",").c_str());
+    printf("  --turbo-kv-proj-dim <n>                     turbo-kv projection dimension (default: %s)\n", join(cmd_params_defaults.turbo_kv_proj_dim, ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
@@ -795,6 +804,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.flash_attn.insert(params.flash_attn.end(), p.begin(), p.end());
+            } else if (arg == "--turbo-kv") {
+                params.turbo_kv.push_back(true);
+            } else if (arg == "--turbo-kv-qjl") {
+                params.turbo_kv_qjl.push_back(true);
+            } else if (arg == "--turbo-kv-proj-dim") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.turbo_kv_proj_dim.insert(params.turbo_kv_proj_dim.end(), p.begin(), p.end());
             } else if (arg == "-mmp" || arg == "--mmap") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1054,6 +1074,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.flash_attn.empty()) {
         params.flash_attn = cmd_params_defaults.flash_attn;
     }
+    if (params.turbo_kv.empty()) {
+        params.turbo_kv = cmd_params_defaults.turbo_kv;
+    }
+    if (params.turbo_kv_qjl.empty()) {
+        params.turbo_kv_qjl = cmd_params_defaults.turbo_kv_qjl;
+    }
+    if (params.turbo_kv_proj_dim.empty()) {
+        params.turbo_kv_proj_dim = cmd_params_defaults.turbo_kv_proj_dim;
+    }
     if (params.devices.empty()) {
         params.devices = cmd_params_defaults.devices;
     }
@@ -1113,6 +1142,9 @@ struct cmd_params_instance {
     int                main_gpu;
     bool               no_kv_offload;
     bool               flash_attn;
+    bool               turbo_kv;
+    bool               turbo_kv_qjl;
+    int                turbo_kv_proj_dim;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1195,6 +1227,9 @@ struct cmd_params_instance {
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.turbo_kv        = turbo_kv;
+        cparams.turbo_kv_qjl    = turbo_kv_qjl;
+        cparams.turbo_kv_proj_dim = turbo_kv_proj_dim;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
@@ -1227,6 +1262,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
+    for (const auto & tkv : params.turbo_kv)
+    for (const auto & tkvqjl : params.turbo_kv_qjl)
+    for (const auto & tkvdim : params.turbo_kv_proj_dim)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
@@ -1255,6 +1293,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .turbo_kv     = */ tkv,
+                /* .turbo_kv_qjl = */ tkvqjl,
+                /* .turbo_kv_proj_dim = */ tkvdim,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1290,6 +1331,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .turbo_kv     = */ tkv,
+                /* .turbo_kv_qjl = */ tkvqjl,
+                /* .turbo_kv_proj_dim = */ tkvdim,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1325,6 +1369,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .turbo_kv     = */ tkv,
+                /* .turbo_kv_qjl = */ tkvqjl,
+                /* .turbo_kv_proj_dim = */ tkvdim,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1365,6 +1412,9 @@ struct test {
     int                      main_gpu;
     bool                     no_kv_offload;
     bool                     flash_attn;
+    bool                     turbo_kv;
+    bool                     turbo_kv_qjl;
+    int                      turbo_kv_proj_dim;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1403,6 +1453,9 @@ struct test {
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
+        turbo_kv       = inst.turbo_kv;
+        turbo_kv_qjl   = inst.turbo_kv_qjl;
+        turbo_kv_proj_dim = inst.turbo_kv_proj_dim;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
@@ -1466,7 +1519,8 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "flash_attn",    "turbo_kv",       "turbo_kv_qjl",
+            "turbo_kv_proj_dim",                "devices",       "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1480,10 +1534,11 @@ struct test {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
-            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe") {
+            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" || field == "turbo_kv_proj_dim") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
+            field == "turbo_kv" || field == "turbo_kv_qjl" ||
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
             return BOOL;
         }
@@ -1553,6 +1608,9 @@ struct test {
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
                                             std::to_string(flash_attn),
+                                            std::to_string(turbo_kv),
+                                            std::to_string(turbo_kv_qjl),
+                                            std::to_string(turbo_kv_proj_dim),
                                             devices_to_string(devices),
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
@@ -1737,6 +1795,15 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return 2;
         }
+        if (field == "turbo_kv") {
+            return 3;
+        }
+        if (field == "turbo_kv_qjl") {
+            return 4;
+        }
+        if (field == "turbo_kv_proj_dim") {
+            return 7;
+        }
         if (field == "devices") {
             return -12;
         }
@@ -1779,6 +1846,15 @@ struct markdown_printer : public printer {
         }
         if (field == "flash_attn") {
             return "fa";
+        }
+        if (field == "turbo_kv") {
+            return "tkv";
+        }
+        if (field == "turbo_kv_qjl") {
+            return "qjl";
+        }
+        if (field == "turbo_kv_proj_dim") {
+            return "tkvdim";
         }
         if (field == "use_mmap") {
             return "mmap";
@@ -1857,6 +1933,15 @@ struct markdown_printer : public printer {
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
+        }
+        if (params.turbo_kv.size() > 1 || params.turbo_kv != cmd_params_defaults.turbo_kv) {
+            fields.emplace_back("turbo_kv");
+        }
+        if (params.turbo_kv_qjl.size() > 1 || params.turbo_kv_qjl != cmd_params_defaults.turbo_kv_qjl) {
+            fields.emplace_back("turbo_kv_qjl");
+        }
+        if (params.turbo_kv_proj_dim.size() > 1 || params.turbo_kv_proj_dim != cmd_params_defaults.turbo_kv_proj_dim) {
+            fields.emplace_back("turbo_kv_proj_dim");
         }
         if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
             fields.emplace_back("devices");
