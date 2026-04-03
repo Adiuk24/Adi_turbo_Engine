@@ -352,10 +352,8 @@ llama_context::llama_context(
 
         sched_reserve();
 
-        if (!cparams.flash_attn) {
-            if (ggml_is_quantized(params.type_v)) {
-                throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
-            }
+        if (!cparams.flash_attn && ggml_is_quantized(params.type_v)) {
+            LLAMA_LOG_WARN("%s: quantized V cache active without flash_attn; non-flash fallback path enabled\n", __func__);
         }
     }
 
@@ -3017,8 +3015,7 @@ llama_context * llama_init_from_model(
     }
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
-        return nullptr;
+        LLAMA_LOG_WARN("%s: V cache quantization without flash_attn uses non-flash fallback\n", __func__);
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
