@@ -2363,11 +2363,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kq, "kq_soft_max", il);
 
         bool used_fused_v_cast = false;
+        bool used_direct_qmat_v = false;
         if (ggml_is_quantized(v->type)) {
             const char * disable_fused_v_cast_env = getenv("LLAMA_TURBO_KV_DISABLE_FUSED_V_CAST");
             const bool disable_fused_v_cast = disable_fused_v_cast_env != nullptr && disable_fused_v_cast_env[0] != '\0' && strcmp(disable_fused_v_cast_env, "0") != 0;
+            const char * direct_qmat_v_env = getenv("LLAMA_TURBO_KV_DIRECT_QMAT_V");
+            const bool use_direct_qmat_v = direct_qmat_v_env != nullptr && direct_qmat_v_env[0] != '\0' && strcmp(direct_qmat_v_env, "0") != 0;
 
-            if (!disable_fused_v_cast && !v_trans) {
+            // Backend-safe direct quantized-V path: only valid when V is already in transposed KV layout.
+            // This avoids per-step dequantization while preserving quant blocks.
+            if (use_direct_qmat_v && v_trans) {
+                cb(v, "v_qmat_direct", il);
+                used_direct_qmat_v = true;
+            } else if (!disable_fused_v_cast && !v_trans) {
                 v = ggml_cast(ctx0, ggml_transpose(ctx0, v), GGML_TYPE_F16);
                 cb(v, "v_cast_t", il);
                 used_fused_v_cast = true;
@@ -2380,6 +2388,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
+        }
+
+        if (used_direct_qmat_v) {
+            const char * direct_qmat_v_f16_env = getenv("LLAMA_TURBO_KV_DIRECT_QMAT_V_F16");
+            const bool direct_qmat_v_f16 = direct_qmat_v_f16_env != nullptr && direct_qmat_v_f16_env[0] != '\0' && strcmp(direct_qmat_v_f16_env, "0") != 0;
+            if (direct_qmat_v_f16 && kq->type == GGML_TYPE_F32) {
+                kq = ggml_cast(ctx0, kq, GGML_TYPE_F16);
+                cb(kq, "kq_softmax_f16", il);
+            }
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);

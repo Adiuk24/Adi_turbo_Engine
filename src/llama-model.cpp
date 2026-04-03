@@ -8166,6 +8166,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
+                const char * v_trans_quant_env = getenv("LLAMA_TURBO_KV_VTRANS_QUANT");
+                const bool v_trans_quant = v_trans_quant_env != nullptr &&
+                                           v_trans_quant_env[0] != '\0' &&
+                                           strcmp(v_trans_quant_env, "0") != 0;
+
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
@@ -8192,7 +8197,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
-                    const bool attn_v_trans = !cparams.flash_attn && !ggml_is_quantized(params.type_v);
+                    const bool attn_v_trans = !cparams.flash_attn &&
+                                              (!ggml_is_quantized(params.type_v) || v_trans_quant);
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
@@ -8252,7 +8258,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 *this,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn && !ggml_is_quantized(params.type_v),
+                                !cparams.flash_attn && (!ggml_is_quantized(params.type_v) || v_trans_quant),
                                 cparams.offload_kqv,
                                 params.swa_full,
                                 cparams.kv_unified,
@@ -8269,7 +8275,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 *this,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn && !ggml_is_quantized(params.type_v),
+                                !cparams.flash_attn && (!ggml_is_quantized(params.type_v) || v_trans_quant),
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
