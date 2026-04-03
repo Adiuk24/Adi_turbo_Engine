@@ -2988,8 +2988,16 @@ llama_context * llama_init_from_model(
     }
 
     if (params.turbo_kv && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        LLAMA_LOG_WARN("%s: turbo_kv keeps flash_attn disabled until projected-KV Metal FA kernels are fully integrated\n", __func__);
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        const char * flash_nonqjl_env = getenv("LLAMA_TURBO_KV_FLASH_NONQJL");
+        const bool flash_nonqjl = flash_nonqjl_env != nullptr &&
+                                   flash_nonqjl_env[0] != '\0' &&
+                                   strcmp(flash_nonqjl_env, "0") != 0;
+        if (!params.turbo_kv_qjl && flash_nonqjl) {
+            LLAMA_LOG_WARN("%s: turbo_kv flash-attn enabled for non-QJL path (experimental)\n", __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: turbo_kv keeps flash_attn disabled until projected-KV Metal FA kernels are fully integrated\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
     }
 
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
