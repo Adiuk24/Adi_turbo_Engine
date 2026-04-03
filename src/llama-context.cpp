@@ -2994,12 +2994,24 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
+        uint32_t min_head_k = UINT32_MAX;
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
+            const uint32_t head_k = model->hparams.n_embd_head_k(il);
+            min_head_k = std::min(min_head_k, head_k);
+
+            if (head_k % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                    __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
+                    __func__, ggml_type_name(params.type_k), blck_size, head_k);
                 return nullptr;
             }
+        }
+
+        // Empirical guardrail: for very small head dimensions, K quantization can
+        // noticeably increase perplexity even at q8_0.
+        if (params.type_k == GGML_TYPE_Q8_0 && min_head_k <= 64) {
+            LLAMA_LOG_WARN("%s: K cache q8_0 on small head dim (min n_embd_head_k=%u) may hurt quality; "
+                           "for quality-critical runs prefer K=f16 with V quantized (e.g. -ctv q8_0)\n",
+                __func__, min_head_k);
         }
     }
 
