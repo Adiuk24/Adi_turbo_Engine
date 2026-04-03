@@ -2362,11 +2362,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
+        bool used_fused_v_cast = false;
         if (ggml_is_quantized(v->type)) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            const char * fused_v_cast_env = getenv("LLAMA_TURBO_KV_FUSED_V_CAST");
+            const bool use_fused_v_cast = fused_v_cast_env != nullptr && fused_v_cast_env[0] != '\0' && strcmp(fused_v_cast_env, "0") != 0;
+
+            if (use_fused_v_cast && !v_trans) {
+                v = ggml_cast(ctx0, ggml_transpose(ctx0, v), GGML_TYPE_F16);
+                cb(v, "v_cast_t", il);
+                used_fused_v_cast = true;
+            } else {
+                v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            }
         }
 
-        if (!v_trans) {
+        if (!v_trans && !used_fused_v_cast) {
             // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);

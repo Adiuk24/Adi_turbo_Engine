@@ -7398,7 +7398,75 @@ template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
-template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
+
+// Specialized q8_0 -> f16 copy kernel with a fallback for transposed views.
+// This keeps correctness for normal contiguous tensors and supports the
+// transposed quantized fallback path used by turbo-kv graph experiments.
+[[host_name("kernel_cpy_q8_0_f16")]]
+kernel void kernel_cpy_q8_0_f16(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i03 = tgpig[2];
+    const int i02 = tgpig[1];
+    const int i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tiitg/ntg[0];
+    const int iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
+
+    const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+
+    const int64_t i3 = n/(args.ne2*args.ne1*args.ne0);
+    const int64_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
+    const int64_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
+    const int64_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+
+    // Transposed q8_0 view: nb01 collapses to a single q8_0 block stride.
+    // In this layout, each dst lane touches a different source row (i0 axis),
+    // so we gather scalar values from distinct blocks.
+    const bool transposed_q8 = args.nb01 == sizeof(block_q8_0) && args.nb00 > args.nb01;
+
+    if (transposed_q8) {
+        device half4x4 * dst_data = (device half4x4 *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+
+        for (int64_t i00 = iw0*ntg[0] + tiitg%ntg[0]; i00 < args.nk0; ) {
+            thread half4x4 temp;
+            thread half * t = (thread half *) &temp;
+
+            const int64_t base_i0 = i00 * 16;
+            const int64_t src_i1  = i01;
+            const int64_t blk_i1  = src_i1 / QK8_0;
+            const int64_t off_i1  = src_i1 % QK8_0;
+
+            for (int j = 0; j < 16; ++j) {
+                const int64_t src_i0 = base_i0 + j;
+                if (src_i0 < args.ne00 && src_i1 < args.ne01) {
+                    device const block_q8_0 * b = (device const block_q8_0 *) (src0 + i03*args.nb03 + i02*args.nb02 + src_i0*args.nb00 + blk_i1*args.nb01);
+                    const float v = (float) b->d * (float) b->qs[off_i1];
+                    t[j] = (half) v;
+                } else {
+                    t[j] = (half) 0.0h;
+                }
+            }
+
+            dst_data[i00] = temp;
+            break;
+        }
+
+        return;
+    }
+
+    device const block_q8_0 * src_data = (device const block_q8_0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device       half4x4    * dst_data = (device       half4x4    *)(dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1 + i0*args.nb0);
+
+    for (int64_t i00 = iw0*ntg[0] + tiitg%ntg[0]; i00 < args.nk0; ) {
+        half4x4 temp;
+        dequantize_q8_0(src_data + i00/2, i00%2, temp);
+        dst_data[i00] = temp;
+        break;
+    }
+}
 
 kernel void kernel_concat(
     constant ggml_metal_kargs_concat & args,
