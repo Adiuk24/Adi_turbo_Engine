@@ -409,6 +409,23 @@ static std::string get_all_kv_cache_types() {
     return msg.str();
 }
 
+static bool kv_cache_allow_unsafe_k_types() {
+    const char * v = getenv("LLAMA_ARG_ALLOW_UNSAFE_K_TYPES");
+    return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static bool kv_cache_k_type_warn_only(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q5_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool parse_bool_value(const std::string & value) {
     if (is_truthy(value)) {
         return true;
@@ -2000,12 +2017,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K\n"
             "allowed values: %s\n"
+            "note: q5_1 is disabled by default in this branch; set LLAMA_ARG_ALLOW_UNSAFE_K_TYPES=1 to override\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            const ggml_type cache_type_k = kv_cache_type_from_str(value);
+
+            // q5_1 currently fails quant-core gate in this branch and can catastrophically
+            // degrade K-cache quality at runtime. Keep an explicit escape hatch for experts.
+            if (cache_type_k == GGML_TYPE_Q5_1 && !kv_cache_allow_unsafe_k_types()) {
+                throw std::runtime_error(
+                    "cache-type-k=q5_1 is disabled by default in this branch due known quality failures; "
+                    "set LLAMA_ARG_ALLOW_UNSAFE_K_TYPES=1 to override for experiments");
+            }
+
+            if (kv_cache_k_type_warn_only(cache_type_k)) {
+                LOG_WRN("cache-type-k=%s is experimental and may significantly degrade quality; "
+                        "prefer q8_0 for K cache\n",
+                        ggml_type_name(cache_type_k));
+            }
+
+            params.cache_type_k = cache_type_k;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -3567,12 +3601,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
+            "note: q5_1 is disabled by default in this branch; set LLAMA_ARG_ALLOW_UNSAFE_K_TYPES=1 to override\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.speculative.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.cache_type_k = kv_cache_type_from_str(value);
+            const ggml_type cache_type_k = kv_cache_type_from_str(value);
+            if (cache_type_k == GGML_TYPE_Q5_1 && !kv_cache_allow_unsafe_k_types()) {
+                throw std::runtime_error(
+                    "cache-type-k-draft=q5_1 is disabled by default in this branch due known quality failures; "
+                    "set LLAMA_ARG_ALLOW_UNSAFE_K_TYPES=1 to override for experiments");
+            }
+
+            if (kv_cache_k_type_warn_only(cache_type_k)) {
+                LOG_WRN("cache-type-k-draft=%s is experimental and may significantly degrade quality; "
+                        "prefer q8_0 for K cache\n",
+                        ggml_type_name(cache_type_k));
+            }
+
+            params.speculative.cache_type_k = cache_type_k;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_DRAFT"));
     add_opt(common_arg(
