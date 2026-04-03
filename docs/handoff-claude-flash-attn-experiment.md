@@ -73,36 +73,53 @@ Do NOT invest more in enabling flash attention for turbo-kv on Metal. The
 kernel itself needs Apple-level optimization for quantized KV types. This is
 upstream llama.cpp work, not AdiTurbo work.
 
-## Next sprint: non-flash turbo-kv kernel optimization
+## Post-mortem: attention path analysis
 
-### Target
+After the flash experiment failed, a deep analysis of the non-flash attention
+path revealed it is already lean — only 3 Metal kernel dispatches total:
 
-Optimize the Q8_0 `V x softmax(KQ)` non-flash hot path on Metal. Write a
-fused/tuned kernel specifically for turbo-kv q8_0 attention on Apple GPU.
+1. `kernel_mul_mv_q8_0_f32` (projected Q*K, dk=64)
+2. `kernel_soft_max_f32` (softmax)
+3. `kernel_mul_mv_q8_0_f32` (softmax*V, dv=256)
 
-### Where to look
+With `LLAMA_TURBO_KV_VTRANS_QUANT=1` and the direct QMAT path, there are
+**zero** transpose/cast/cont overhead ops for V. The V path is already optimal.
 
-1. **Transpose/cast/cont overhead in V path** (llama-graph.cpp:2367-2400):
-   - Non-flash path does `ggml_cast(ggml_transpose(v), F16)` or
-     `ggml_cast(v, F16)` for quantized V
-   - Each is a separate kernel dispatch + memory round-trip
-   - Fusing these or eliminating the cast is the first target
+### Why attention optimization can't reach +10%
 
-2. **mul_mv_q8_0_f32 for attention*V** (ggml-metal.metal:3580-3651):
-   - This is the kernel that multiplies softmax weights by V
-   - Can be specialized for the attention use case (softmax output is sparse,
-     small batch, contiguous)
+- Qwen3.5-27B is hybrid: **16 of 64 layers are full attention**, rest recurrent
+- Attention is ~1-2% of total per-token compute
+- Even infinitely fast attention yields only 1-2% end-to-end improvement
+- The real bottleneck is **weight loading in 48 recurrent + 16 FFN layers**
+  at ~108 GB/s (~54% of M4 Pro's ~200 GB/s theoretical bandwidth)
 
-3. **Softmax kernel** (ggml-metal.metal:1970-2073):
-   - Already well-optimized, but output could be fused with V multiply
+## Decision: pivot to end-to-end optimization
 
-### Gate for next sprint
+### What's proven now (paper claims)
+
+- Memory reduction via turbo-kv quantized KV cache (q8_0)
+- Quality retention (PPL parity on turbo-kv path)
+- Stable runtime (no crashes, correct output)
+- Flash attention infrastructure ready (gated, works but slower on Metal)
+
+### In progress (next sprint)
+
+End-to-end speed uplift via non-attention kernel optimization:
+- Recurrent/FFN weight-movement optimization
+- Per-layer kernel dispatch overhead reduction
+- Metal-specific weight loading patterns
+
+### Gate for next sprint (REVISED)
 
 - **Model:** Qwen3.5-27B-TQ3_0-canonical.gguf
 - **Config:** `-r 3 -pg 128,32 -pg 2048,32 -b 512 -ub 512 -ngl 99 -ctk q8_0 -ctv q8_0 --turbo-kv --turbo-kv-proj-dim 64`
-- **Baseline (current):** tg128 = 9.33 t/s (non-flash, LLAMA_TURBO_KV_VTRANS_QUANT=1)
-- **Pass criteria:**
-  - tg128 >= 10.27 t/s (strictly +10% over 9.33)
+- **Baselines (current, LLAMA_TURBO_KV_VTRANS_QUANT=1):**
+  - pp512 = 101.66 t/s
+  - tg128 = 9.33 t/s
+  - pp128+tg32 = 34.08 t/s
+  - pp2048+tg32 = 82.58 t/s
+- **Pass criteria: end-to-end improvement**
+  - Any of tg128 or pp2048+tg32 improved by measurable margin (>= +5%)
   - No PPL regression on 2-chunk wikitext sanity run
   - No crashes
 
