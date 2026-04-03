@@ -2364,10 +2364,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         bool used_fused_v_cast = false;
         if (ggml_is_quantized(v->type)) {
-            const char * fused_v_cast_env = getenv("LLAMA_TURBO_KV_FUSED_V_CAST");
-            const bool use_fused_v_cast = fused_v_cast_env != nullptr && fused_v_cast_env[0] != '\0' && strcmp(fused_v_cast_env, "0") != 0;
+            const char * disable_fused_v_cast_env = getenv("LLAMA_TURBO_KV_DISABLE_FUSED_V_CAST");
+            const bool disable_fused_v_cast = disable_fused_v_cast_env != nullptr && disable_fused_v_cast_env[0] != '\0' && strcmp(disable_fused_v_cast_env, "0") != 0;
 
-            if (use_fused_v_cast && !v_trans) {
+            if (!disable_fused_v_cast && !v_trans) {
                 v = ggml_cast(ctx0, ggml_transpose(ctx0, v), GGML_TYPE_F16);
                 cb(v, "v_cast_t", il);
                 used_fused_v_cast = true;
