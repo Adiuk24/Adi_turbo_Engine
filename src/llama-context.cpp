@@ -3008,6 +3008,7 @@ llama_context * llama_init_from_model(
 
     }
 
+    bool auto_switched_small_head_k = false;
     if (ggml_is_quantized(params.type_k)) {
         uint32_t min_head_k = UINT32_MAX;
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
@@ -3027,11 +3028,26 @@ llama_context * llama_init_from_model(
                                "auto-switching K cache to f16 (set LLAMA_TURBO_KV_FORCE_Q8_K=1 to keep q8_0)\n",
                     __func__, min_head_k);
                 params.type_k = GGML_TYPE_F16;
+                auto_switched_small_head_k = true;
             } else {
                 LLAMA_LOG_WARN("%s: K cache q8_0 on small head dim (min n_embd_head_k=%u) may hurt quality; "
                                "for quality-critical runs prefer K=f16 with V quantized (e.g. -ctv q8_0)\n",
                     __func__, min_head_k);
             }
+        }
+    }
+
+    // Preserve KV memory savings when K is auto-switched to f16 on small-head models.
+    // Users can force V to remain f16 with LLAMA_TURBO_KV_KEEP_V_F16=1.
+    if (auto_switched_small_head_k && params.type_v == GGML_TYPE_F16) {
+        const char * keep_v_f16_env = getenv("LLAMA_TURBO_KV_KEEP_V_F16");
+        const bool keep_v_f16 = keep_v_f16_env != nullptr &&
+                                keep_v_f16_env[0] != '\0' &&
+                                strcmp(keep_v_f16_env, "0") != 0;
+        if (!keep_v_f16) {
+            params.type_v = GGML_TYPE_Q8_0;
+            LLAMA_LOG_WARN("%s: auto-switching V cache to q8_0 to keep memory savings with small-head turbo_kv fallback "
+                           "(set LLAMA_TURBO_KV_KEEP_V_F16=1 to keep V=f16)\n", __func__);
         }
     }
 
