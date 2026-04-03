@@ -2928,8 +2928,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_concurrency_reset(ctx);
         }
 
-        // note: for simplicity assume the K is larger or equal than V
-        GGML_ASSERT(ne10 >= ne20);
+        // note: the kernel handles ne10 < ne20 (dk < dv) correctly via separate
+        // DK/DV template parameters. This arises with turbo-kv dim-reduction.
 
         // ne00 + 2*ncpsg*(nsg)
         // for each query, we load it as f16 in shared memory (ne00)
