@@ -3006,12 +3006,32 @@ llama_context * llama_init_from_model(
             }
         }
 
+    }
+
+    if (ggml_is_quantized(params.type_k)) {
+        uint32_t min_head_k = UINT32_MAX;
+        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+            min_head_k = std::min(min_head_k, model->hparams.n_embd_head_k(il));
+        }
+
         // Empirical guardrail: for very small head dimensions, K quantization can
         // noticeably increase perplexity even at q8_0.
         if (params.type_k == GGML_TYPE_Q8_0 && min_head_k <= 64) {
-            LLAMA_LOG_WARN("%s: K cache q8_0 on small head dim (min n_embd_head_k=%u) may hurt quality; "
-                           "for quality-critical runs prefer K=f16 with V quantized (e.g. -ctv q8_0)\n",
-                __func__, min_head_k);
+            const char * force_small_head_q8_k_env = getenv("LLAMA_TURBO_KV_FORCE_Q8_K");
+            const bool force_small_head_q8_k = force_small_head_q8_k_env != nullptr &&
+                                               force_small_head_q8_k_env[0] != '\0' &&
+                                               strcmp(force_small_head_q8_k_env, "0") != 0;
+
+            if (params.turbo_kv && !force_small_head_q8_k) {
+                LLAMA_LOG_WARN("%s: K cache q8_0 on small head dim (min n_embd_head_k=%u) hurts quality in this branch; "
+                               "auto-switching K cache to f16 (set LLAMA_TURBO_KV_FORCE_Q8_K=1 to keep q8_0)\n",
+                    __func__, min_head_k);
+                params.type_k = GGML_TYPE_F16;
+            } else {
+                LLAMA_LOG_WARN("%s: K cache q8_0 on small head dim (min n_embd_head_k=%u) may hurt quality; "
+                               "for quality-critical runs prefer K=f16 with V quantized (e.g. -ctv q8_0)\n",
+                    __func__, min_head_k);
+            }
         }
     }
 
