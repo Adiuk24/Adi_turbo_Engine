@@ -1869,6 +1869,17 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    const char * q8_copy_batch_env = getenv("LLAMA_TURBO_KV_Q8_COPY_BATCH");
+    const bool q8_copy_batch_enabled = q8_copy_batch_env == nullptr || q8_copy_batch_env[0] == '\0' || strcmp(q8_copy_batch_env, "0") != 0;
+
+    // Quantized-V fallback spends a lot of time in q8_0 -> f16 copies.
+    // Batch several destination rows per threadgroup to reduce dispatch overhead.
+    if (q8_copy_batch_enabled && op->src[0]->type == GGML_TYPE_Q8_0 && op->type == GGML_TYPE_F16 && nk0 <= 64) {
+        const int max_tg_threads = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+        const int max_nrptg = std::max(1, max_tg_threads / nth);
+        nrptg = std::min(4, max_nrptg);
+    }
+
     nth = std::min<int>(nth, nk0);
 
     ggml_metal_kargs_cpy args = {
