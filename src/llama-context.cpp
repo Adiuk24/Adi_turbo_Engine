@@ -2992,18 +2992,12 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (params.turbo_kv && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        const char * flash_nonqjl_env = getenv("LLAMA_TURBO_KV_FLASH_NONQJL");
-        const bool flash_nonqjl = flash_nonqjl_env != nullptr &&
-                                   flash_nonqjl_env[0] != '\0' &&
-                                   strcmp(flash_nonqjl_env, "0") != 0;
-        if (!params.turbo_kv_qjl && flash_nonqjl) {
-            LLAMA_LOG_WARN("%s: turbo_kv flash-attn enabled for non-QJL path (experimental)\n", __func__);
-        } else {
-            LLAMA_LOG_WARN("%s: turbo_kv keeps flash_attn disabled until projected-KV Metal FA kernels are fully integrated\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-        }
+    if (params.turbo_kv && params.turbo_kv_qjl && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        // QJL modifies K/V dimensions — flash attention kernels need projected-KV support.
+        LLAMA_LOG_WARN("%s: turbo_kv with QJL disables flash_attn (projected-KV FA kernels not yet implemented)\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
+    // turbo_kv without QJL is a no-op on the compute graph — flash attention works normally.
 
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
