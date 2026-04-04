@@ -2980,6 +2980,11 @@ llama_context * llama_init_from_model(
         }
         LLAMA_LOG_WARN("%s: turbo_kv enabled (experimental), proj_dim=%u, qjl=%s\n",
             __func__, params.turbo_kv_proj_dim, params.turbo_kv_qjl ? "on" : "off");
+        if (!params.turbo_kv_qjl) {
+            LLAMA_LOG_WARN("%s: turbo_kv without QJL skips K/V dimension reduction (no effect on "
+                           "compute graph). Enable QJL (--turbo-kv-qjl) for actual dim reduction.\n",
+                __func__);
+        }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

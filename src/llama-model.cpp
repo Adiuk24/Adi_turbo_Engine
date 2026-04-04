@@ -8197,8 +8197,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
-                    const bool attn_v_trans = !cparams.flash_attn &&
-                                              (!ggml_is_quantized(params.type_v) || v_trans_quant);
+                    // v_trans with quantized V on non-flash path is broken:
+                    // ggml_cast on transposed quantized tensors loses stride info.
+                    // Force v_trans=false for quantized V when flash is off.
+                    const bool attn_v_trans = !cparams.flash_attn && !ggml_is_quantized(params.type_v);
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
@@ -8258,7 +8260,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 *this,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn && (!ggml_is_quantized(params.type_v) || v_trans_quant),
+                                !cparams.flash_attn && !ggml_is_quantized(params.type_v),
                                 cparams.offload_kqv,
                                 params.swa_full,
                                 cparams.kv_unified,
@@ -8275,7 +8277,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 *this,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn && (!ggml_is_quantized(params.type_v) || v_trans_quant),
+                                !cparams.flash_attn && !ggml_is_quantized(params.type_v),
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,

@@ -2553,33 +2553,25 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * k_store = k_cur;
     ggml_tensor * v_store = v_cur;
-    if (cparams.turbo_kv && !cparams.turbo_kv_qjl) {
+    if (cparams.turbo_kv && cparams.turbo_kv_qjl) {
+        // QJL path: project K/V with residual correction on tail dims.
+        // Without QJL, skip dim reduction entirely — zeroing tail dims
+        // destroys information and causes PPL regression (7.45 → 30+).
         const int64_t proj_dim = (int64_t) cparams.turbo_kv_proj_dim;
         const int64_t k_dim = k_cur->ne[0];
         const int64_t v_dim = v_cur->ne[0];
         if (proj_dim > 0 && proj_dim < k_dim) {
             ggml_tensor * k_head = turbo_kv_project_dim0_3d(ctx0, k_cur, proj_dim, cparams.turbo_kv_qjl);
             ggml_tensor * k_tail_src = ggml_view_3d(ctx0, k_cur, k_dim - proj_dim, k_cur->ne[1], k_cur->ne[2], k_cur->nb[1], k_cur->nb[2], proj_dim * k_cur->nb[0]);
-            ggml_tensor * k_tail = nullptr;
-            if (cparams.turbo_kv_qjl) {
-                // QJL-style residual quant/dequant on dropped dims (codebook in normalized domain).
-                k_tail = turbo_kv_qjl_quant_dequant(ctx0, k_tail_src, k_cur->type);
-                cb(k_tail, "tq_k_residual", il);
-            } else {
-                k_tail = ggml_scale(ctx0, ggml_cont(ctx0, k_tail_src), 0.0f);
-            }
+            ggml_tensor * k_tail = turbo_kv_qjl_quant_dequant(ctx0, k_tail_src, k_cur->type);
+            cb(k_tail, "tq_k_residual", il);
             k_store = ggml_concat(ctx0, k_head, k_tail, 0);
             cb(k_store, "tq_k_store", il);
         }
         if (proj_dim > 0 && proj_dim < v_dim) {
             ggml_tensor * v_head = ggml_view_3d(ctx0, v_cur, proj_dim, v_cur->ne[1], v_cur->ne[2], v_cur->nb[1], v_cur->nb[2], 0);
             ggml_tensor * v_tail_src = ggml_view_3d(ctx0, v_cur, v_dim - proj_dim, v_cur->ne[1], v_cur->ne[2], v_cur->nb[1], v_cur->nb[2], proj_dim * v_cur->nb[0]);
-            ggml_tensor * v_tail = nullptr;
-            if (cparams.turbo_kv_qjl) {
-                v_tail = ggml_scale(ctx0, ggml_cont(ctx0, v_tail_src), 0.0f);
-            } else {
-                v_tail = ggml_scale(ctx0, ggml_cont(ctx0, v_tail_src), 0.0f);
-            }
+            ggml_tensor * v_tail = ggml_scale(ctx0, ggml_cont(ctx0, v_tail_src), 0.0f);
             v_store = ggml_concat(ctx0, v_head, v_tail, 0);
             cb(v_store, "tq_v_store", il);
         }
@@ -2607,8 +2599,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // Phase-B projected-KV scaffold:
     // apply deterministic dim-reduction on Q/K (dim0 view) and keep V full-size.
-    // This wires the runtime path without introducing projection matrices yet.
-    if (cparams.turbo_kv && !cparams.turbo_kv_qjl) {
+    // Only active with QJL — without it, dim reduction destroys information.
+    if (cparams.turbo_kv && cparams.turbo_kv_qjl) {
         const int64_t proj_dim = (int64_t) cparams.turbo_kv_proj_dim;
         if (proj_dim > 0 && proj_dim < q->ne[0] && proj_dim < k->ne[0]) {
             ggml_tensor * q_proj = turbo_kv_project_dim0_4d(ctx0, q, proj_dim, cparams.turbo_kv_qjl);
