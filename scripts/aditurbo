@@ -301,12 +301,12 @@ run_ui() {
         [[ -n "${ctv}" ]] || ctv="f16"
     fi
 
-    local ui_root=""
-    ui_root="$(mktemp -d "${TMPDIR:-/tmp}/aditurbo-ui.XXXXXX")"
-    cp "${ui_file}" "${ui_root}/index.html"
+    local ui_root="${ROOT_DIR}/scripts"
+    local run_root=""
+    run_root="$(mktemp -d "${TMPDIR:-/tmp}/aditurbo-ui.XXXXXX")"
 
-    local server_log="${ui_root}/llama-server.log"
-    local web_log="${ui_root}/aditurbo-web.log"
+    local server_log="${run_root}/llama-server.log"
+    local web_log="${run_root}/aditurbo-web.log"
 
     local server_cmd=("${BIN_DIR}/llama-server" -m "${model}" --host "${host}" --port "${api_port}" -c "${ctx}" -t "${threads}" -b "${batch}" -ub "${ubatch}")
     if [[ "${cpu_mode}" -eq 1 ]]; then
@@ -344,7 +344,7 @@ run_ui() {
         if [[ -n "${web_pid:-}" ]] && kill -0 "${web_pid}" >/dev/null 2>&1; then
             kill "${web_pid}" >/dev/null 2>&1 || true
         fi
-        rm -rf "${ui_root}" >/dev/null 2>&1 || true
+        rm -rf "${run_root}" >/dev/null 2>&1 || true
     }
     trap cleanup_ui EXIT INT TERM
 
@@ -366,13 +366,10 @@ run_ui() {
         warn "API readiness timed out; continuing"
     fi
 
-    (
-        cd "${ui_root}"
-        "${PYTHON_BIN}" -m http.server "${ui_port}" --bind "${ui_host}" >"${web_log}" 2>&1
-    ) &
+    "${PYTHON_BIN}" -m http.server "${ui_port}" --bind "${ui_host}" --directory "${ui_root}" >"${web_log}" 2>&1 &
     local web_pid="$!"
 
-    local ui_url="http://${ui_host}:${ui_port}/?api=http://${host}:${api_port}&model=$(basename "${model}")"
+    local ui_url="http://${ui_host}:${ui_port}/aditurbo-ui.html?api=http://${host}:${api_port}&model=$(basename "${model}")"
     log "API: http://${host}:${api_port}"
     log "UI:  ${ui_url}"
     log "Press Ctrl+C to stop."
