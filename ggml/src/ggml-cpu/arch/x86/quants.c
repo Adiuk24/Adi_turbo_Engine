@@ -1349,11 +1349,6 @@ void ggml_vec_dot_tq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     for (int i = 0; i < nb; ++i) {
         __m256i sumi = _mm256_setzero_si256();
-        int32_t ysum = 0;
-
-        for (int k = 0; k < QK_K/16; ++k) {
-            ysum += y[i].bsums[k];
-        }
 
         // Process 4 groups of 8 values (= 32 values, 12 bytes) per iteration
         for (int j = 0; j < QK_K/8; j += 4) {
@@ -1380,11 +1375,13 @@ void ggml_vec_dot_tq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             sumi = _mm256_add_epi16(sumi, _mm256_maddubs_epi16(qx, qy));
         }
 
-        const __m256i ysum_v = _mm256_set1_epi16((int16_t)ysum);
+        // Per-lane bsums offset correction (not broadcast total — that would
+        // multiply the correction by 16 after horizontal sum)
+        const __m256i ysum = _mm256_loadu_si256((const __m256i *) y[i].bsums);
         const __m256 d = _mm256_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d));
 
-        // Subtract 4*ysum offset (values are [0..7], center is 4)
-        sumi = _mm256_sub_epi16(sumi, _mm256_slli_epi16(ysum_v, 2));
+        // Subtract 4*bsums per lane (center offset = 4 for 3-bit [0..7])
+        sumi = _mm256_sub_epi16(sumi, _mm256_slli_epi16(ysum, 2));
         // Horizontal pair sum 16-bit -> 32-bit
         sumi = _mm256_madd_epi16(sumi, _mm256_set1_epi16(1));
 
