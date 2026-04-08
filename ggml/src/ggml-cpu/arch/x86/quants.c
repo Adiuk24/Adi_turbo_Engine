@@ -1332,6 +1332,74 @@ void ggml_vec_dot_tq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+void ggml_vec_dot_tq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+#if defined(__AVX2__)
+    __m256 sumf = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        __m256i sumi = _mm256_setzero_si256();
+        int32_t ysum = 0;
+
+        for (int k = 0; k < QK_K/16; ++k) {
+            ysum += y[i].bsums[k];
+        }
+
+        // Process 4 groups of 8 values (= 32 values, 12 bytes) per iteration
+        for (int j = 0; j < QK_K/8; j += 4) {
+            const uint8_t * qp = x[i].qs + 3*j;
+
+            // Scalar extract of 3-bit values into temp buffer.
+            // 3-bit values cross byte boundaries, making pure AVX2 shuffle
+            // complex due to lane-crossing limitations. Hybrid approach:
+            // scalar unpack + AVX2 dot product.
+            int8_t tmp_x[32];
+            for (int g = 0; g < 4; g++) {
+                const uint32_t p = (uint32_t)qp[3*g+0]
+                                | ((uint32_t)qp[3*g+1] << 8)
+                                | ((uint32_t)qp[3*g+2] << 16);
+                for (int m = 0; m < 8; m++) {
+                    tmp_x[8*g + m] = (int8_t)((p >> (3*m)) & 7);
+                }
+            }
+
+            const __m256i qx = _mm256_loadu_si256((const __m256i *)tmp_x);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *)(y[i].qs + 8*j));
+
+            // maddubs: treats first arg as unsigned, second as signed
+            sumi = _mm256_add_epi16(sumi, _mm256_maddubs_epi16(qx, qy));
+        }
+
+        const __m256i ysum_v = _mm256_set1_epi16((int16_t)ysum);
+        const __m256 d = _mm256_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d));
+
+        // Subtract 4*ysum offset (values are [0..7], center is 4)
+        sumi = _mm256_sub_epi16(sumi, _mm256_slli_epi16(ysum_v, 2));
+        // Horizontal pair sum 16-bit -> 32-bit
+        sumi = _mm256_madd_epi16(sumi, _mm256_set1_epi16(1));
+
+        sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi), d), sumf);
+    }
+
+    *s = hsum_float_8(sumf);
+#else
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
+    ggml_vec_dot_tq3_0_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
