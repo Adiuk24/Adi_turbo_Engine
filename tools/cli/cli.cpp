@@ -24,13 +24,7 @@
 #endif
 
 const char * LLAMA_ASCII_LOGO = R"(
-▄▄ ▄▄
-██ ██
-██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
-██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
-██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
-                                    ██    ██
-                                    ▀▀    ▀▀
+AdiTurbo
 )";
 
 static std::atomic<bool> g_is_interrupted = false;
@@ -353,7 +347,7 @@ int main(int argc, char ** argv) {
 
     // TODO: maybe support it later?
     if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {
-        console::error("--no-conversation is not supported by llama-cli\n");
+        console::error("--no-conversation is not supported by AdiTurbo CLI\n");
         console::error("please use llama-completion instead\n");
     }
 

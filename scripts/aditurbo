@@ -76,9 +76,10 @@ default_dataset_path() {
 
 print_main_help() {
     cat <<EOF
-AdiTurbo CLI
+AdiTurbo CLI (Adi CCP)
 Usage:
   aditurbo <command> [options]
+  adi-ccp  <command> [options]
 
 Commands:
   install   Build required binaries and optionally link CLI to PATH
@@ -451,7 +452,9 @@ run_install() {
     if [[ "$do_link" -eq 1 ]]; then
         mkdir -p "${link_dir}"
         ln -sf "${ROOT_DIR}/scripts/aditurbo" "${link_dir}/aditurbo"
+        ln -sf "${ROOT_DIR}/scripts/aditurbo" "${link_dir}/adi-ccp"
         log "linked: ${link_dir}/aditurbo -> ${ROOT_DIR}/scripts/aditurbo"
+        log "linked: ${link_dir}/adi-ccp -> ${ROOT_DIR}/scripts/aditurbo"
         if [[ ":$PATH:" != *":${link_dir}:"* ]]; then
             warn "${link_dir} is not in PATH. Add: export PATH=\"${link_dir}:\$PATH\""
         fi
@@ -992,7 +995,9 @@ run_package() {
     mkdir -p "${stage}/${name}/gguf-py"
 
     cp "${ROOT_DIR}/scripts/aditurbo" "${stage}/${name}/bin/aditurbo"
+    cp "${ROOT_DIR}/scripts/aditurbo" "${stage}/${name}/bin/adi-ccp"
     chmod +x "${stage}/${name}/bin/aditurbo"
+    chmod +x "${stage}/${name}/bin/adi-ccp"
     cp "${ROOT_DIR}/scripts/aditurbo-ui.html" "${stage}/${name}/scripts/"
     cp "${BIN_DIR}/llama-cli" "${stage}/${name}/bin/"
     cp "${BIN_DIR}/llama-quantize" "${stage}/${name}/bin/"
@@ -1009,7 +1014,7 @@ AdiTurbo CLI Package
 Install:
   1) Copy this folder wherever you want
   2) Add "<package>/bin" to PATH
-  3) Run: aditurbo help
+  3) Run: aditurbo help  (or adi-ccp help)
 
 Included binaries:
   llama-cli, llama-quantize, llama-bench, llama-perplexity, llama-imatrix

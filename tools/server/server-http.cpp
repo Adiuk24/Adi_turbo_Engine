@@ -74,7 +74,7 @@ bool server_http_context::init(const common_params & params) {
     srv.reset(new httplib::Server());
 #endif
 
-    srv->set_default_headers({{"Server", "llama.cpp"}});
+    srv->set_default_headers({{"Server", "AdiTurbo Engine"}});
     srv->set_logger(log_server_request);
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
         // this is fail-safe; exceptions should already handled by `ex_wrapper`
@@ -439,4 +439,3 @@ void server_http_context::post(const std::string & path, const server_http_conte
         process_handler_response(std::move(request), response, res);
     });
 }
-
