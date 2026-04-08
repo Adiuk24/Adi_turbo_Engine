@@ -1291,7 +1291,12 @@ void ggml_vec_dot_tq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     __m256 sumf = _mm256_setzero_ps();
     const __m256i mask = _mm256_set1_epi8(0x0F);
 
+    const __m256i ones = _mm256_set1_epi16(1);
+
     for (int i = 0; i < nb; ++i) {
+        // Accumulate in 32-bit to avoid int16 overflow.
+        // Max per maddubs lane = 2*15*127 = 3810; 4 iters * 2 accumulators
+        // can reach 30480+16256 = 46736 in 16-bit after bsums correction.
         __m256i sumi0 = _mm256_setzero_si256();
         __m256i sumi1 = _mm256_setzero_si256();
 
@@ -1307,20 +1312,23 @@ void ggml_vec_dot_tq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m256i qy0 = _mm256_loadu_si256((const __m256i *)(y[i].qs + 2*j));
             const __m256i qy1 = _mm256_loadu_si256((const __m256i *)(y[i].qs + 2*j + 32));
 
-            // Multiply unsigned weights * signed activations -> 16-bit
-            sumi0 = _mm256_add_epi16(sumi0, _mm256_maddubs_epi16(qx0, qy0));
-            sumi1 = _mm256_add_epi16(sumi1, _mm256_maddubs_epi16(qx1, qy1));
+            // maddubs -> 16-bit, then madd(ones) -> 32-bit to avoid overflow
+            sumi0 = _mm256_add_epi32(sumi0, _mm256_madd_epi16(_mm256_maddubs_epi16(qx0, qy0), ones));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(qx1, qy1), ones));
         }
 
-        // Offset correction: subtract 8 * sum(y) for the unsigned->signed shift
+        // Offset correction in 32-bit: subtract 8 * sum(y)
         const __m256i ysum = _mm256_loadu_si256((const __m256i *) y[i].bsums);
         const __m256 d = _mm256_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d));
 
-        sumi0 = _mm256_add_epi16(sumi0, sumi1);
-        sumi0 = _mm256_sub_epi16(sumi0, _mm256_slli_epi16(ysum, 3)); // subtract 8*bsums
-        sumi0 = _mm256_madd_epi16(sumi0, _mm256_set1_epi16(1)); // horizontal pair sum -> 32-bit
+        // Widen bsums to 32-bit, multiply by 8, subtract
+        const __m256i ysum32_lo = _mm256_madd_epi16(ysum, _mm256_set1_epi16(1));
+        const __m256i bsums_x8 = _mm256_slli_epi32(ysum32_lo, 3);
 
-        sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi0), d), sumf);
+        __m256i sumi = _mm256_add_epi32(sumi0, sumi1);
+        sumi = _mm256_sub_epi32(sumi, bsums_x8);
+
+        sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi), d), sumf);
     }
 
     *s = hsum_float_8(sumf);
