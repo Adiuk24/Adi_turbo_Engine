@@ -369,6 +369,24 @@ run_ui() {
     "${PYTHON_BIN}" -m http.server "${ui_port}" --bind "${ui_host}" --directory "${ui_root}" >"${web_log}" 2>&1 &
     local web_pid="$!"
 
+    local web_ready=0
+    local web_path="/aditurbo-ui.html"
+    for i in $(seq 1 40); do
+        if curl -sSf "http://${ui_host}:${ui_port}${web_path}" >/dev/null 2>&1; then
+            web_ready=1
+            break
+        fi
+        if ! kill -0 "${web_pid}" >/dev/null 2>&1; then
+            warn "UI web server failed to start; showing logs"
+            tail -n 60 "${web_log}" >&2 || true
+            return 1
+        fi
+        sleep 0.2
+    done
+    if [[ "${web_ready}" -ne 1 ]]; then
+        warn "UI web server did not become ready on ${ui_host}:${ui_port}"
+    fi
+
     local ui_url="http://${ui_host}:${ui_port}/aditurbo-ui.html?api=http://${host}:${api_port}&model=$(basename "${model}")"
     log "API: http://${host}:${api_port}"
     log "UI:  ${ui_url}"
