@@ -7576,6 +7576,8 @@ template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
+template [[host_name("kernel_cpy_tq3_s_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tq3_s, 2, dequantize_tq3_s>;
+template [[host_name("kernel_cpy_tq3_s_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tq3_s, 2, dequantize_tq3_s>;
 
 // Specialized q8_0 -> f16 copy kernel with a fallback for transposed views.
 // This keeps correctness for normal contiguous tensors and supports the
