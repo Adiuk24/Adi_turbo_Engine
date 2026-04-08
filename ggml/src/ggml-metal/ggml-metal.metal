@@ -355,6 +355,11 @@ void quantize_tq3_0(device const float * src, device block_tq3_0 & dst) {
 
 void quantize_tq3_s(device const float * src, device block_tq3_s & dst) {
 #pragma METAL fp math_mode(safe)
+    // NOTE: WHT rotation is NOT applied here — it must be applied at the graph level
+    // (before SET_ROWS) to match the inverse rotation after GET_ROWS/flash_attn.
+    // The Metal dequantize outputs 4-16 values at a time via templates, making
+    // block-level inverse WHT (which needs all 32 values) impossible inside dequant.
+    // See upstream llama.cpp PR #21038 for the graph-level rotation approach.
     float amax = 0.0f;
 
     for (int j = 0; j < QK_TQ3_S; ++j) {
