@@ -315,9 +315,19 @@ run_ui() {
         server_cmd+=(-ngl "${ngl}")
     fi
     if [[ "${turbo_kv}" -eq 1 ]]; then
-        server_cmd+=(--turbo-kv --turbo-kv-proj-dim "${proj_dim}" -ctk "${ctk}" -ctv "${ctv}")
-        if [[ "${turbo_qjl}" -eq 1 ]]; then
-            server_cmd+=(--turbo-kv-qjl)
+        local server_help=""
+        server_help="$("${BIN_DIR}/llama-server" --help 2>&1 || true)"
+        if grep -q -- "--turbo-kv" <<<"${server_help}"; then
+            server_cmd+=(--turbo-kv --turbo-kv-proj-dim "${proj_dim}" -ctk "${ctk}" -ctv "${ctv}")
+            if [[ "${turbo_qjl}" -eq 1 ]]; then
+                if grep -q -- "--turbo-kv-qjl" <<<"${server_help}"; then
+                    server_cmd+=(--turbo-kv-qjl)
+                else
+                    warn "llama-server does not support --turbo-kv-qjl; launching without qjl"
+                fi
+            fi
+        else
+            warn "llama-server does not support --turbo-kv flags; launching UI without turbo-kv"
         fi
     fi
     if [[ ${#extra_args[@]} -gt 0 ]]; then
@@ -328,7 +338,7 @@ run_ui() {
     local server_pid="$!"
 
     cleanup_ui() {
-        if kill -0 "${server_pid}" >/dev/null 2>&1; then
+        if [[ -n "${server_pid:-}" ]] && kill -0 "${server_pid}" >/dev/null 2>&1; then
             kill "${server_pid}" >/dev/null 2>&1 || true
         fi
         if [[ -n "${web_pid:-}" ]] && kill -0 "${web_pid}" >/dev/null 2>&1; then
