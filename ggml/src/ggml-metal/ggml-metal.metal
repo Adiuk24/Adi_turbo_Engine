@@ -353,6 +353,32 @@ void quantize_tq3_0(device const float * src, device block_tq3_0 & dst) {
     }
 }
 
+void quantize_tq3_s(device const float * src, device block_tq3_s & dst) {
+#pragma METAL fp math_mode(safe)
+    float amax = 0.0f;
+
+    for (int j = 0; j < QK_TQ3_S; ++j) {
+        amax = MAX(amax, fabs(src[j]));
+    }
+
+    const float d  = amax / 4.0f;
+    const float id = d ? 1.0f / d : 0.0f;
+
+    dst.d = d;
+
+    for (int j = 0; j < QK_TQ3_S/8; ++j) {
+        uint p = 0;
+        for (int m = 0; m < 8; ++m) {
+            int xi = MIN(7, MAX(0, (int) round(src[8*j + m] * id + 4.0f)));
+            p |= (uint(xi) << (3*m));
+        }
+
+        dst.qs[3*j + 0] = (p >>  0) & 0xFF;
+        dst.qs[3*j + 1] = (p >>  8) & 0xFF;
+        dst.qs[3*j + 2] = (p >> 16) & 0xFF;
+    }
+}
+
 void quantize_iq4_nl(device const float * src, device block_iq4_nl & dst) {
 #pragma METAL fp math_mode(safe)
     float amax = 0.0f; // absolute max
@@ -10611,6 +10637,8 @@ template [[host_name("kernel_set_rows_q5_1_i64")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_set_rows_tq3_s_i64")]]  kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_tq3_s,  quantize_tq3_s>;
+template [[host_name("kernel_set_rows_tq3_s_i32")]]  kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_tq3_s,  quantize_tq3_s>;
 
 typedef decltype(kernel_set_rows_qk<int64_t, block_tq4_0, QK_K, quantize_tq4_0>) set_rows_qk_t;
 

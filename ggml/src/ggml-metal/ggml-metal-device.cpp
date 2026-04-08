@@ -813,9 +813,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
-        // GGML_TYPE_TQ3_S: intentionally no Metal support.
-        // TQ3_S has block_size=32 (not 256 like other TQ types) and is designed
-        // for KV cache quantization which runs on CPU.
         case GGML_TYPE_IQ2_XXS:
             {
                 nsg = N_SG_IQ2_XXS;
@@ -1048,9 +1045,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
-        // GGML_TYPE_TQ3_S: intentionally no Metal support.
-        // TQ3_S has block_size=32 (not 256 like other TQ types) and is designed
-        // for KV cache quantization which runs on CPU.
         case GGML_TYPE_IQ2_XXS:
             {
                 nsg = N_SG_IQ2_XXS;
