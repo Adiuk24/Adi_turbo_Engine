@@ -367,7 +367,103 @@ run_ui() {
         warn "API readiness timed out; continuing"
     fi
 
-    "${PYTHON_BIN}" -m http.server "${ui_port}" --bind "${ui_host}" --directory "${ui_root}" >"${web_log}" 2>&1 &
+    "${PYTHON_BIN}" - "${ui_root}" "${ui_host}" "${ui_port}" "${ROOT_DIR}/scripts/aditurbo" >"${web_log}" 2>&1 <<'PY' &
+import http.server
+import json
+import os
+import socketserver
+import subprocess
+import sys
+
+UI_ROOT = sys.argv[1]
+HOST = sys.argv[2]
+PORT = int(sys.argv[3])
+ADITURBO = sys.argv[4]
+
+ALLOWED_SOURCE_MODE = {"f16", "hf-dir", "hf-repo"}
+ALLOWED_TYPES = {"TQ1_0", "TQ2_0", "TQ3_0", "TQ4_0"}
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=UI_ROOT, **kwargs)
+
+    def _json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/api/health":
+            self._json(200, {"ok": True, "service": "aditurbo-ui"})
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        if self.path != "/api/convert":
+            self._json(404, {"ok": False, "error": "not_found"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(min(length, 128 * 1024))
+            req = json.loads(raw.decode("utf-8") or "{}")
+        except Exception as e:
+            self._json(400, {"ok": False, "error": f"invalid_json: {e}"})
+            return
+
+        source_mode = str(req.get("source_mode", "f16")).strip().lower()
+        source = str(req.get("source", "")).strip()
+        out = str(req.get("out", "")).strip()
+        qtype = str(req.get("type", "TQ3_0")).strip().upper()
+        imatrix = str(req.get("imatrix", "")).strip()
+        calibration = str(req.get("calibration", "")).strip()
+
+        if source_mode not in ALLOWED_SOURCE_MODE:
+            self._json(400, {"ok": False, "error": "invalid_source_mode"})
+            return
+        if qtype not in ALLOWED_TYPES:
+            self._json(400, {"ok": False, "error": "invalid_quant_type"})
+            return
+        if not source:
+            self._json(400, {"ok": False, "error": "source_required"})
+            return
+        if not out:
+            self._json(400, {"ok": False, "error": "out_required"})
+            return
+
+        cmd = [ADITURBO, "convert"]
+        if source_mode == "f16":
+            cmd += ["--f16", source]
+        elif source_mode == "hf-dir":
+            cmd += ["--hf-dir", source]
+        else:
+            cmd += ["--hf-repo", source]
+
+        cmd += ["--type", qtype, "--out", out]
+        if imatrix:
+            cmd += ["--imatrix", imatrix]
+        if calibration:
+            cmd += ["--calibration", calibration]
+
+        proc = subprocess.run(cmd, text=True, capture_output=True)
+        self._json(200, {
+            "ok": proc.returncode == 0,
+            "command": cmd,
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout[-20000:],
+            "stderr": proc.stderr[-20000:],
+        })
+
+class ThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+with ThreadingServer((HOST, PORT), Handler) as httpd:
+    httpd.serve_forever()
+PY
     local web_pid="$!"
 
     local web_ready=0

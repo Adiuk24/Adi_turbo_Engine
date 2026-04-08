@@ -459,8 +459,10 @@
           <div class="convert-actions">
             <button class="small-btn" id="buildConvertCmdBtn">Build Cmd</button>
             <button class="small-btn" id="copyConvertCmdBtn">Copy</button>
+            <button class="small-btn" id="runConvertBtn">Run Convert</button>
           </div>
           <textarea id="convertCmdPreview" readonly></textarea>
+          <textarea id="convertLog" readonly placeholder="Conversion logs will appear here"></textarea>
         </div>
       </aside>
 
@@ -539,7 +541,9 @@
       convertCalibration: document.getElementById("convertCalibration"),
       buildConvertCmdBtn: document.getElementById("buildConvertCmdBtn"),
       copyConvertCmdBtn: document.getElementById("copyConvertCmdBtn"),
-      convertCmdPreview: document.getElementById("convertCmdPreview")
+      runConvertBtn: document.getElementById("runConvertBtn"),
+      convertCmdPreview: document.getElementById("convertCmdPreview"),
+      convertLog: document.getElementById("convertLog")
     };
 
     let busy = false;
@@ -796,6 +800,66 @@
       el.convertCmdPreview.value = buildConvertCommand();
     }
 
+    async function runConvert() {
+      refreshConvertPreview();
+      const sourceMode = el.convertSourceMode.value;
+      const sourceValue = el.convertSourceValue.value.trim();
+      const type = el.convertType.value;
+      const out = el.convertOut.value.trim();
+      const imatrix = el.convertImatrix.value.trim();
+      const calibration = el.convertCalibration.value.trim();
+
+      if (!sourceValue || !out) {
+        setStatus("Source and output are required");
+        return;
+      }
+
+      const payload = {
+        source_mode: sourceMode,
+        source: sourceValue,
+        type,
+        out,
+        imatrix,
+        calibration
+      };
+
+      setStatus("Running convert...");
+      el.runConvertBtn.disabled = true;
+      el.runConvertBtn.textContent = "Running...";
+      el.convertLog.value = "Submitting conversion job...\n";
+      try {
+        const res = await fetch(`/api/convert`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const json = await res.json();
+        const lines = [];
+        lines.push(`exit_code: ${json.exit_code}`);
+        lines.push(`ok: ${json.ok}`);
+        lines.push("");
+        lines.push(`command: ${Array.isArray(json.command) ? json.command.join(" ") : ""}`);
+        if (json.stdout) {
+          lines.push("");
+          lines.push("--- stdout ---");
+          lines.push(String(json.stdout).trim());
+        }
+        if (json.stderr) {
+          lines.push("");
+          lines.push("--- stderr ---");
+          lines.push(String(json.stderr).trim());
+        }
+        el.convertLog.value = lines.join("\n") + "\n";
+        setStatus(json.ok ? "Convert complete" : "Convert failed");
+      } catch (err) {
+        el.convertLog.value += `\nError: ${err.message}\n`;
+        setStatus("Convert error");
+      } finally {
+        el.runConvertBtn.disabled = false;
+        el.runConvertBtn.textContent = "Run Convert";
+      }
+    }
+
     function createNewConversation() {
       const id = uid();
       state.conversations.unshift({
@@ -992,6 +1056,7 @@
         setStatus("Copy failed");
       }
     });
+    el.runConvertBtn.addEventListener("click", runConvert);
 
     [
       el.convertSourceMode,
