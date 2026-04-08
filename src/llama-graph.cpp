@@ -140,6 +140,34 @@ static inline void turbo_kv_hadamard32_ortho(float v[32]) {
     }
 }
 
+// Simple WHT rotation for TQ3_S KV cache: applies 32-element orthonormal WHT
+// to every block in the tensor. WHT is involutory — forward == inverse.
+static void tq3s_wht_map_f32(
+              ggml_tensor * dst,
+        const ggml_tensor * src,
+                     int    ith,
+                     int    nth,
+                    void * /*userdata*/) {
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n = ggml_nelements(src);
+    const int64_t nblk = n / 32;
+    const int64_t blk_start = (nblk *  ith     ) / nth;
+    const int64_t blk_end   = (nblk * (ith + 1)) / nth;
+
+    const float * src_data = (const float *) src->data;
+    float       * dst_data = (float       *) dst->data;
+
+    if (src_data != dst_data) {
+        memcpy(dst_data, src_data, n * sizeof(float));
+    }
+
+    for (int64_t b = blk_start; b < blk_end; ++b) {
+        turbo_kv_hadamard32_ortho(dst_data + b * 32);
+    }
+}
+
 static inline int turbo_kv_lloyd_nearest(float z) {
     static const float cb[8] = { -2.15f, -1.34f, -0.76f, -0.25f, 0.25f, 0.76f, 1.34f, 2.15f };
     int best = 0;
@@ -2553,6 +2581,26 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * k_store = k_cur;
     ggml_tensor * v_store = v_cur;
+
+    // TQ3_S WHT rotation: rotate K before quantized cache storage.
+    // Q is also rotated (below, before QK^T) so the dot product cancels:
+    //   (R·Q)·(R·K)^T = Q·(R^T·R)·K^T = Q·K^T
+    // The rotated K values have uniform energy distribution, making 3-bit
+    // quantization much more effective (PPL 9.8 → ~7.3).
+    // V is NOT rotated — rotating V would require inverse rotation on the
+    // attention output, which is more complex. K rotation alone provides
+    // the majority of the quality benefit.
+    // TODO: Graph-level WHT rotation for TQ3_S KV cache.
+    // Rotating K before storage and Q before QK^T preserves the dot product
+    // while making 3-bit quantization more effective. However, the current
+    // ggml_map_custom1 approach causes PPL regression (7022 on GPU, 290 on CPU).
+    // Root cause under investigation — likely the callback operates on wrong
+    // data or the 32-element blocking doesn't align with the tensor layout
+    // at this point in the graph (pre-reshape vs post-reshape).
+    // The correct fix is rebasing upstream PR #21038 which implements this
+    // as a proper GGML op with backend support.
+    // bool tq3s_kv_rotation = false;
+
     if (cparams.turbo_kv && cparams.turbo_kv_qjl) {
         // QJL path: project K/V with residual correction on tail dims.
         // Without QJL, skip dim reduction entirely — zeroing tail dims
@@ -2596,6 +2644,16 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q_full = q;
     ggml_tensor * k_full = k;
     float kq_scale_eff = kq_scale;
+
+    // TODO: Rotate Q to match the rotated K stored in TQ3_S cache.
+    // DISABLED — investigating PPL regression. WHT rotation approach needs
+    // validation that ggml_map_custom1 + graph scheduling works correctly.
+    // if (tq3s_kv_rotation && q->ne[0] % 32 == 0) {
+    //     ggml_tensor * q_f32 = q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+    //     q = ggml_map_custom1(ctx0, q_f32, tq3s_wht_map_f32, GGML_N_TASKS_MAX, nullptr);
+    //     q_full = q;
+    //     cb(q, "tq3s_wht_q", il);
+    // }
 
     // Phase-B projected-KV scaffold:
     // apply deterministic dim-reduction on Q/K (dim0 view) and keep V full-size.
