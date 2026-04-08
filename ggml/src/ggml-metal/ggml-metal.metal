@@ -860,10 +860,10 @@ void dequantize_tq3_s_t4(device const block_tq3_s * xb, short il, thread type4 &
     // il ranges 0..7, selecting 4 values at a time from 32 total
     // Each group of 8 values is packed in 3 bytes
     const int group = il / 2;      // which 8-value group (0..3)
-    const int half  = il % 2;      // which half of the group (0=first 4, 1=second 4)
+    const int ghalf = il % 2;      // which half of the group (0=first 4, 1=second 4)
     device const uint8_t * qs = xb->qs + 3*group;
     const uint p = (uint)qs[0] | ((uint)qs[1] << 8) | ((uint)qs[2] << 16);
-    const int base = half * 4;     // bit offset: 0 or 12
+    const int base = ghalf * 4;    // bit offset: 0 or 12
 
     for (int m = 0; m < 4; ++m) {
         reg[m] = ((float)((p >> (3*(base + m))) & 7) - 4.0f) * d;
@@ -6765,6 +6765,22 @@ template [[host_name("kernel_flash_attn_ext_q8_0_dk256_dv256")]] kernel flash_at
 template [[host_name("kernel_flash_attn_ext_q8_0_dk320_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 320, 256>;
 template [[host_name("kernel_flash_attn_ext_q8_0_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 512, 512>;
 template [[host_name("kernel_flash_attn_ext_q8_0_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 576, 512>;
+
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk32_dv32"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 32,  32>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk40_dv40"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 40,  40>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk48_dv48"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 48,  48>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 64,  64>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk72_dv72"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 72,  72>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 80,  80>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk96_dv96"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 96,  96>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk112_dv112")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 112, 112>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk192_dv192")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 192, 192>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk192_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 192, 128>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk256_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 256, 256>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk320_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 320, 256>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 512, 512>;
+template [[host_name("kernel_flash_attn_ext_tq3_s_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_s, 2, dequantize_tq3_s, block_tq3_s, 2, dequantize_tq3_s, 576, 512>;
 
 #undef FA_TYPES
 #undef FA_TYPES_BF
