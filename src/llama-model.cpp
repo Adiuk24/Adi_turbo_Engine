@@ -614,6 +614,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     hparams.swa_type = LLAMA_SWA_TYPE_NONE;
                 }
 
+                // AfMoE uses RoPE on ALL layers (unlike Llama4 which skips global-attn layers)
+                hparams.n_no_rope_layer_step = 0;
+
                 // Default to sigmoid if not set
                 if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
                     hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
@@ -6454,7 +6457,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (static_cast<uint32_t>(i) >= hparams.n_layer_dense_lead) {
                             // MoE layers
                             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
 
                             // grouped expert weights
                             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
