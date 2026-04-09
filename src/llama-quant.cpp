@@ -499,8 +499,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         // Mirrors the IQ2 logic below but uses Q4_K/Q5_K for sensitive tensors.
         const bool dense_tq4 = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0 && qs.model.hparams.n_expert == 0;
         const bool dense_tq3 = ftype == LLAMA_FTYPE_MOSTLY_TQ3_0 && qs.model.hparams.n_expert == 0;
+        const bool dense_tq2 = (ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ1_0) && qs.model.hparams.n_expert == 0;
         if (category_is_attn_v(category)) {
-            if (dense_tq4) {
+            if (dense_tq2) {
+                // Dense TQ2_0/TQ1_0: attention V is critical — must keep at Q4_K minimum.
+                new_type = GGML_TYPE_Q4_K;
+            } else if (dense_tq4) {
                 new_type = GGML_TYPE_Q5_K;
             } else if (dense_tq3) {
                 // Dense TQ3_0: preserve attention quality to close gap with Q3_K_S.
@@ -518,17 +522,19 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             ++qs.i_attention_wv;
         }
-        else if ((dense_tq4 || dense_tq3) && category == tensor_category::ATTENTION_Q) {
+        else if ((dense_tq4 || dense_tq3 || dense_tq2) && category == tensor_category::ATTENTION_Q) {
             new_type = tensor->ne[0] % ggml_blck_size(GGML_TYPE_Q4_K) == 0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_0;
         }
-        else if ((dense_tq4 || dense_tq3) && category == tensor_category::ATTENTION_K) {
+        else if ((dense_tq4 || dense_tq3 || dense_tq2) && category == tensor_category::ATTENTION_K) {
             new_type = tensor->ne[0] % ggml_blck_size(GGML_TYPE_Q4_K) == 0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_0;
         }
         else if (qs.model.hparams.n_expert >= 4 && category == tensor_category::ATTENTION_K) {
             new_type = GGML_TYPE_Q4_K;
         }
         else if (category == tensor_category::ATTENTION_OUTPUT) {
-            if (dense_tq4) {
+            if (dense_tq2) {
+                new_type = GGML_TYPE_Q4_K;
+            } else if (dense_tq4) {
                 new_type = GGML_TYPE_Q8_0;
             } else if (dense_tq3) {
                 new_type = GGML_TYPE_Q5_K;
@@ -547,11 +553,16 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             ++qs.i_ffn_gate;
         }
         else if (category == tensor_category::FFN_DOWN) {
-            if (dense_tq4) {
+            if (dense_tq2) {
+                // TQ2_0: edge layers (first/last 1/4) at Q3_K for quality stability.
+                const bool edge_layer = qs.i_ffn_down < qs.n_ffn_down/4 || qs.i_ffn_down >= 3*qs.n_ffn_down/4;
+                if (edge_layer) {
+                    new_type = GGML_TYPE_Q3_K;
+                }
+            } else if (dense_tq4) {
                 const bool edge_layer = qs.i_ffn_down < qs.n_ffn_down/4 || qs.i_ffn_down >= 3*qs.n_ffn_down/4;
                 new_type = edge_layer ? GGML_TYPE_Q8_0 : GGML_TYPE_Q5_0;
             } else if (dense_tq3) {
-                // Edge layers (first/last 1/8) at Q4_K for quality; bulk at TQ3_0 for size.
                 const bool edge_layer = qs.i_ffn_down < qs.n_ffn_down/8 || qs.i_ffn_down >= 7*qs.n_ffn_down/8;
                 if (edge_layer) {
                     new_type = GGML_TYPE_Q4_K;
@@ -567,7 +578,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             ++qs.i_ffn_down;
         }
         else if (category == tensor_category::FFN_UP) {
-            if (dense_tq4) {
+            if (dense_tq2) {
+                const bool edge_layer = qs.i_ffn_up < qs.n_ffn_up/4 || qs.i_ffn_up >= 3*qs.n_ffn_up/4;
+                if (edge_layer) {
+                    new_type = GGML_TYPE_Q3_K;
+                }
+            } else if (dense_tq4) {
                 const bool edge_layer = qs.i_ffn_up < qs.n_ffn_up/4 || qs.i_ffn_up >= 3*qs.n_ffn_up/4;
                 new_type = edge_layer ? GGML_TYPE_Q8_0 : GGML_TYPE_Q5_0;
             } else if (dense_tq3) {
