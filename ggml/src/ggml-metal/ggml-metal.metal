@@ -8599,32 +8599,45 @@ void kernel_mul_mv_tq2_0_f32_impl(
 
     float sumf[nr0] = {0.f};
 
-    for (int ib = 0; ib < nb; ib++) {
-        device const float * yb = y + ib * QK_K + tid * 8;
+    // TQ2_0 packing: qs[m] byte contains 4 elements at bit pairs 0-1,2-3,4-5,6-7.
+    // Bit pair n of qs[m] = element at position (m + n*32) in the 128-element half-block.
+    // Each thread handles 2 qs bytes = 8 elements scattered at stride 32.
+    // Thread tid reads qs[byte_group + tid_in_half], where:
+    //   byte_group = (tid / 16) * 32  (selects first or second 32-byte qs chunk)
+    //   tid_in_half = tid % 16        (byte within the chunk)
+    // The 8 elements per thread are at positions:
+    //   byte_group*4 + tid_in_half + {0, 32, 64, 96, 128_offset...}
 
-        float sumy = 0.f;
-        float yl[8];
-        for (int j = 0; j < 8; j++) {
-            yl[j] = yb[j];
-            sumy += yl[j];
-        }
+    for (int ib = 0; ib < nb; ib++) {
+        const short byte_group = (tid / 16) * 32;
+        const short tid_in_half = tid % 16;
 
         for (short row = 0; row < nr0; row++) {
             device const block_tq2_0 * xr = x + ib + row * nb;
-            // 8 values = 2 bytes (4 values per byte at 2 bits each)
-            device const uint8_t * qs = xr->qs + tid * 2;
             const float d = xr->d;
 
             float acc = 0.f;
+            float sumy = 0.f;
+
+            // Process 2 consecutive qs bytes (= 8 elements at stride-32 positions)
             for (int j = 0; j < 2; j++) {
-                const uint8_t q = qs[j];
-                acc += yl[4*j + 0] * (float)((q >> 0) & 3);
-                acc += yl[4*j + 1] * (float)((q >> 2) & 3);
-                acc += yl[4*j + 2] * (float)((q >> 4) & 3);
-                acc += yl[4*j + 3] * (float)((q >> 6) & 3);
+                const uint8_t q = xr->qs[byte_group + tid_in_half + j*16];
+                // Bit pair n corresponds to element: (byte_group*4) + (tid_in_half + j*16) + n*32
+                // But in the sequential activation array, these elements are at:
+                //   pos = byte_group*4 + (tid_in_half + j*16) + n*32
+                // where byte_group*4 = 0 or 128
+                const int base = byte_group * 4 + tid_in_half + j * 16;
+                for (int n = 0; n < 4; n++) {
+                    const int pos = base + n * 32;
+                    const float yval = y[ib * QK_K + pos];
+                    const float xval = (float)((q >> (n*2)) & 3) - 1.0f;
+                    acc += xval * yval;
+                    sumy += yval;
+                }
             }
 
-            sumf[row] += d * (acc - 1.f * sumy);
+            // No need for separate sumy correction — already subtracted 1.0 per element
+            sumf[row] += d * acc;
         }
     }
 
