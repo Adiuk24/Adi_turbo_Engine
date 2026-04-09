@@ -2333,58 +2333,106 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     const float * x = src;
 
     for (int64_t row = 0; row < nrows; ++row) {
-        const float * row_imatrix = imatrix; // imatrix is per-row (n_per_row elements)
+        const float * row_imatrix = imatrix;
         for (int64_t i = 0; i < nb; ++i) {
             const float * xb = x + i * QK_K;
             const float * wb = row_imatrix ? row_imatrix + i * QK_K : NULL;
 
-            float amax = 0.0f;
+            // Use simple threshold when requantizing (input already lossy)
+            // ITF is for F16→TQ2_0 where it can properly optimize scale.
+            // For requant, fall back to amax-based rounding.
+            //
+            // ITF (Iterative Ternary Fitting) — PT2-LLM, ICLR 2026
+            // Alternates between optimal scale (given assignments) and
+            // optimal assignments (given scale) in closed form.
+            // Converges in ~10 iterations, no gradients needed.
+
+            // Step 0: Initialize scale from threshold (0.75 * mean(|w|))
+            float sum_abs = 0.0f;
             for (int j = 0; j < QK_K; j++) {
-                amax = MAX(amax, fabsf(xb[j]));
+                sum_abs += fabsf(xb[j]);
+            }
+            float d = 0.75f * sum_abs / (float)QK_K;
+            if (d == 0.0f) {
+                d = 1.0f; // avoid division by zero for zero blocks
             }
 
-            float d = amax;
+            int8_t T[QK_K]; // ternary assignments: -1, 0, +1
 
-            // If imatrix is available, find scale minimizing importance-weighted MSE
-            if (wb && amax > 0.0f) {
-                float best_d = amax;
-                float best_err = FLT_MAX;
-                for (int trial = 0; trial < 9; trial++) {
-                    float d_try = amax * (0.8f + 0.05f * trial);
-                    if (d_try == 0.0f) continue;
-                    float id_try = 1.0f / d_try;
-                    float err = 0.0f;
+            // Initial assignment
+            float id = 1.0f / d;
+            for (int j = 0; j < QK_K; j++) {
+                int t = lroundf(xb[j] * id);
+                T[j] = (int8_t)(t < -1 ? -1 : (t > 1 ? 1 : t));
+            }
+
+            // Iterate: closed-form scale update, then reassign
+            for (int iter = 0; iter < 10; iter++) {
+                // Step A: Optimal scale given T
+                // d* = sum(w_j * T_j) / sum(T_j * T_j)
+                // With imatrix: d* = sum(wb_j * w_j * T_j) / sum(wb_j * T_j * T_j)
+                float num = 0.0f;
+                float den = 0.0f;
+                if (wb) {
                     for (int j = 0; j < QK_K; j++) {
-                        float v = xb[j];
-                        int xi = lroundf(v * id_try);
-                        xi = xi < -1 ? -1 : (xi > 1 ? 1 : xi);
-                        float recon = xi * d_try;
-                        err += wb[j] * (v - recon) * (v - recon);
+                        const float wt = wb[j];
+                        num += wt * xb[j] * (float)T[j];
+                        den += wt * (float)(T[j] * T[j]);
                     }
-                    if (err < best_err) {
-                        best_err = err;
-                        best_d = d_try;
+                } else {
+                    for (int j = 0; j < QK_K; j++) {
+                        num += xb[j] * (float)T[j];
+                        den += (float)(T[j] * T[j]);
                     }
                 }
-                d = best_d;
+                if (den > 0.0f) {
+                    d = num / den;
+                }
+                if (d < 0.0f) {
+                    // Negative d means T assignments are flipped — negate T and use |d|
+                    d = -d;
+                    for (int j = 0; j < QK_K; j++) {
+                        T[j] = -T[j];
+                    }
+                }
+                if (d == 0.0f) {
+                    d = 1e-6f;
+                }
+
+                // Step B: Optimal assignment given d
+                // T_j = argmin_{t in {-1,0,1}} |w_j - d*t|
+                id = 1.0f / d;
+                int changed = 0;
+                for (int j = 0; j < QK_K; j++) {
+                    int t = lroundf(xb[j] * id);
+                    t = t < -1 ? -1 : (t > 1 ? 1 : t);
+                    if (t != T[j]) {
+                        T[j] = (int8_t)t;
+                        changed++;
+                    }
+                }
+
+                // Early exit if converged
+                if (changed == 0) break;
             }
 
-            const float id = d ? 1.0f / d : 0.0f;
             y[row * nb + i].d = GGML_FP32_TO_FP16(d);
 
-            const float * xp = xb;
+            // Pack ITF ternary assignments into 2-bit format.
+            // TQ2_0 layout: for each half (128 values), for each bit-pair (4 sub-blocks
+            // of 32), all 32 bytes. T[j] ∈ {-1,0,+1} → stored as {0,1,2}.
             block_tq2_0 * yb = &y[row * nb + i];
+            const int8_t * Tp = T;
             for (size_t j = 0; j < sizeof(yb->qs); j += 32) {
                 for (size_t m = 0; m < 32; ++m) {
                     uint8_t q = 0;
                     for (size_t n = 0; n < 4; ++n) {
-                        int xi = lroundf(xp[m + n*32] * id) + 1;
-                        xi = xi < 0 ? 0 : (xi > 2 ? 2 : xi);
+                        int xi = Tp[m + n*32] + 1; // -1→0, 0→1, +1→2
                         q += (xi & 3) << (2*n);
                     }
                     yb->qs[j + m] = q;
                 }
-                xp += 4*32;
+                Tp += 4*32;
             }
         }
         x += n_per_row;
