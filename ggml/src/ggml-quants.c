@@ -231,11 +231,8 @@ void quantize_row_q5_1_ref(const float * GGML_RESTRICT x, block_q5_1 * GGML_REST
             const float f0 = (x[i*qk + 0    + j] - min)*id;
             const float f1 = (x[i*qk + qk/2 + j] - min)*id;
 
-            const int i0 = lround(f0 + 0.5);
-            const int i1 = lround(f1 + 0.5);
-
-            const uint8_t xi0 = (uint8_t)i0;
-            const uint8_t xi1 = (uint8_t)i1;
+            const uint8_t xi0 = (uint8_t)lroundf(f0);
+            const uint8_t xi1 = (uint8_t)lroundf(f1);
 
             y[i].qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
 
