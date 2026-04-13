@@ -753,6 +753,33 @@ static std::vector<size_t> unicode_regex_split_custom_afmoe(const std::string & 
     return bpe_offsets;
 }
 
+static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        size_t pos = offset_ini;
+        while (pos < offset_end) {
+            const bool is_newline = (cpts[pos] == '\n');
+            const size_t run_start = pos;
+            while (pos < offset_end && (cpts[pos] == '\n') == is_newline) {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - run_start);
+        }
+    }
+
+    return bpe_offsets;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
@@ -766,6 +793,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);
+    } else if (regex_expr == "[^\\n]+|[\\n]+") {
+        bpe_offsets = unicode_regex_split_custom_newlines(text, offsets);
     } else if (regex_expr == "\\p{AFMoE_digits}") {
         // AFMOE digit pattern - use custom implementation for proper splitting
         bpe_offsets = unicode_regex_split_custom_afmoe(text, offsets);
@@ -912,7 +941,7 @@ bool unicode_cpt_is_han(uint32_t cpt) {
     return false;
 }
 
-std::vector<std::string> unicode_regex_split(const std::string & text, const std::vector<std::string> & regex_exprs) {
+std::vector<std::string> unicode_regex_split(const std::string & text, const std::vector<std::string> & regex_exprs, bool byte_encode) {
     // unicode categories
     static const std::map<std::string, int> k_ucat_enum = {
         { "\\p{N}", unicode_cpt_flags::NUMBER },
@@ -1099,5 +1128,9 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
         start += offset;
     }
 
-    return unicode_byte_encoding_process(bpe_words);
+    if (byte_encode) {
+        return unicode_byte_encoding_process(bpe_words);
+    }
+
+    return bpe_words;
 }
