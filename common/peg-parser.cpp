@@ -273,6 +273,38 @@ void common_peg_ast_arena::visit(const common_peg_parse_result & result, const c
     }
 }
 
+common_peg_ast_id common_peg_ast_arena::find_by_tag(const common_peg_ast_node & parent, const std::string & tag, int max_depth) const {
+    for (auto child_id : parent.children) {
+        const auto & child = get(child_id);
+        if (child.tag == tag) {
+            return child_id;
+        }
+        if (max_depth > 1) {
+            auto result = find_by_tag(child, tag, max_depth - 1);
+            if (result != COMMON_PEG_INVALID_AST_ID) {
+                return result;
+            }
+        }
+    }
+    return COMMON_PEG_INVALID_AST_ID;
+}
+
+common_peg_ast_id common_peg_ast_arena::find_by_rule(const common_peg_ast_node & parent, const std::string & rule, int max_depth) const {
+    for (auto child_id : parent.children) {
+        const auto & child = get(child_id);
+        if (child.rule == rule) {
+            return child_id;
+        }
+        if (max_depth > 1) {
+            auto result = find_by_rule(child, rule, max_depth - 1);
+            if (result != COMMON_PEG_INVALID_AST_ID) {
+                return result;
+            }
+        }
+    }
+    return COMMON_PEG_INVALID_AST_ID;
+}
+
 struct parser_executor;
 
 common_peg_parser_id common_peg_arena::add_parser(common_peg_parser_variant parser) {
