@@ -24,6 +24,7 @@
 #include <limits>
 #include <array>
 #include <functional>
+#include <cfloat>
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
@@ -403,6 +404,11 @@ ggml_tensor * clip_graph::build_vit(
                 Kcur = add_pos(Kcur, layer);
                 cb(Qcur, "Qcur_pos", il);
                 cb(Kcur, "Kcur_pos", il);
+            }
+
+            if (proj_type == PROJECTOR_TYPE_GEMMA4V) {
+                Vcur = ggml_rms_norm(ctx0, Vcur, eps);
+                cb(Vcur, "Vcur_normed", il);
             }
 
             cur = build_attn(layer.o_w, layer.o_b,
@@ -808,6 +814,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_mobilenetv5>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_GEMMA4V:
+            {
+                builder = std::make_unique<clip_graph_gemma4v>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
             {
@@ -877,6 +887,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         case PROJECTOR_TYPE_LFM2A:
             {
                 builder = std::make_unique<clip_graph_conformer>(ctx, img);
+            } break;
+        case PROJECTOR_TYPE_GEMMA4A:
+            {
+                builder = std::make_unique<clip_graph_gemma4a>(ctx, img);
             } break;
         case PROJECTOR_TYPE_GLM4V:
             {
@@ -1257,6 +1271,16 @@ struct clip_model_loader {
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                     } break;
 
+                case PROJECTOR_TYPE_GEMMA4V:
+                    {
+                        hparams.rope_theta = 100.0f;
+                        hparams.n_merge = 3; // pooling_kernel_size
+                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        hparams.set_limit_image_tokens(252, 280);
+                        hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                    } break;
+
                 case PROJECTOR_TYPE_GEMMA3NV:
                     {
                         // Gemma3n uses MobileNetV5 which produces 256 tokens (16x16)
@@ -1366,6 +1390,16 @@ struct clip_model_loader {
                         hparams.audio_window_len       = 400;
                         hparams.audio_hop_len          = 160;
                     } break;
+                case PROJECTOR_TYPE_GEMMA4A:
+                    {
+                        // Gemma4 feature_extraction_gemma4.py:
+                        // frame_length_ms=20 -> 320 samples, n_fft=512, hop=10ms -> 160
+                        hparams.audio_chunk_len        = 0;  // no fixed-length padding
+                        hparams.audio_sample_rate      = 16000;
+                        hparams.audio_n_fft            = 512;
+                        hparams.audio_window_len       = 320;  // 20ms frame (NOT 25ms/400)
+                        hparams.audio_hop_len          = 160;
+                    } break;
                 case PROJECTOR_TYPE_JANUS_PRO:
                     {
                         hparams.image_pad_color   = {127, 127, 127};
@@ -1462,6 +1496,11 @@ struct clip_model_loader {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
 
+        auto fin = std::ifstream(fname, std::ios::binary);
+        if (!fin) {
+            throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+        }
+
         // helper function
         auto get_tensor = [&](const std::string & name, bool required = true) {
             ggml_tensor * cur = ggml_get_tensor(ctx_meta.get(), name.c_str());
@@ -1476,6 +1515,18 @@ struct clip_model_loader {
                 cur = data_tensor;
             }
             return cur;
+        };
+
+        auto get_scalar = [&](const std::string & name, float default_val) {
+            auto it = tensor_offset.find(name);
+            if (it == tensor_offset.end()) {
+                return default_val;
+            }
+            size_t offset = it->second;
+            fin.seekg(offset, std::ios::beg);
+            float value;
+            fin.read(reinterpret_cast<char*>(&value), sizeof(float));
+            return value;
         };
 
         model.class_embedding = get_tensor(TN_CLASS_EMBD, false);
@@ -1712,6 +1763,32 @@ struct clip_model_loader {
                 {
                     model.mm_input_proj_w = get_tensor(TN_MM_INP_PROJ);
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
+                } break;
+            case PROJECTOR_TYPE_GEMMA4V:
+                {
+                    model.mm_input_proj_w = get_tensor(TN_MM_INP_PROJ);
+                    model.std_bias  = get_tensor(TN_STD_BIAS,  false);
+                    model.std_scale = get_tensor(TN_STD_SCALE, false);
+                    // load scalar for Gemma4ClippableLinear
+                    for (auto * tensor : tensors_to_load) {
+                        std::string name = tensor->name;
+                        if (string_ends_with(name, ".weight")) {
+                            std::string name_inp_max = name;
+                            std::string name_inp_min = name;
+                            std::string name_out_max = name;
+                            std::string name_out_min = name;
+                            string_replace_all(name_inp_max, ".weight", ".input_max");
+                            string_replace_all(name_inp_min, ".weight", ".input_min");
+                            string_replace_all(name_out_max, ".weight", ".output_max");
+                            string_replace_all(name_out_min, ".weight", ".output_min");
+                            model.clamp_info_map[name] = {
+                                get_scalar(name_inp_max, FLT_MAX),
+                                get_scalar(name_inp_min, -FLT_MAX),
+                                get_scalar(name_out_max, FLT_MAX),
+                                get_scalar(name_out_min, -FLT_MAX)
+                            };
+                        }
+                    }
                 } break;
             case PROJECTOR_TYPE_GEMMA3NV:
                 {
@@ -2034,6 +2111,76 @@ struct clip_model_loader {
                         layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "bias"));
                     }
                 } break;
+            case PROJECTOR_TYPE_GEMMA4A:
+                {
+                    for (int i = 0; i < 2; i++) {
+                        model.sscp_conv_w[i] = get_tensor(string_format(TN_A_CONV1D, i, "weight"));
+                        model.sscp_conv_b[i] = get_tensor(string_format(TN_A_CONV1D, i, "bias"), false);
+                        model.sscp_norm_w[i] = get_tensor(string_format(TN_A_CONV1D_NORM, i, "weight"), false);
+                    }
+                    model.sscp_inp_proj_w = get_tensor(string_format(TN_A_INP_PROJ, "weight"));
+                    model.sscp_inp_proj_b = get_tensor(string_format(TN_A_INP_PROJ, "bias"), false);
+                    model.audio_out_proj_w = get_tensor(string_format(TN_A_OUT_PROJ, "weight"), false);
+                    model.audio_out_proj_b = get_tensor(string_format(TN_A_OUT_PROJ, "bias"), false);
+                    // audio multimodal embedder (mm.a.* namespace, not mm.*)
+                    model.mm_soft_emb_norm_w = get_tensor(string_format(TN_A_MM_SOFT_EMB_N, "weight"), false);
+                    model.mm_input_proj_w    = get_tensor(string_format(TN_A_MM_INP_PROJ, "weight"), false);
+
+                    // Per-layer tensors NOT loaded by the generic loop above
+                    for (int il = 0; il < hparams.n_layer; ++il) {
+                        auto & layer = model.layers[il];
+
+                        // Gemma4 audio conformer-specific tensors
+                        layer.ff_norm_w        = get_tensor(string_format(TN_FFN_NORM, prefix, il, "weight"));
+                        layer.attn_pre_norm_w  = get_tensor(string_format(TN_A_ATTN_PRE_NORM, prefix, il, "weight"), false);
+                        layer.per_dim_scale_w  = get_tensor(string_format(TN_A_PER_DIM_SCALE, prefix, il, "weight"), false);
+                        layer.per_dim_k_scale_w = get_tensor(string_format(TN_A_PER_DIM_K_SCALE, prefix, il, "weight"), false);
+                        layer.attn_k_rel_w     = get_tensor(string_format(TN_A_ATTN_K_REL, prefix, il, "weight"), false);
+
+                        // Convolution module
+                        // Note: conv_norm / norm_conv are swapped in GGUF due to
+                        // upstream tensor_mapping.py, so we load them in reverse order
+                        layer.norm_conv_w  = get_tensor(string_format(TN_CONV_NORM, prefix, il, "weight"), false);
+                        layer.norm_conv_b  = get_tensor(string_format(TN_CONV_NORM, prefix, il, "bias"), false);
+                        layer.conv_pw1_w   = get_tensor(string_format(TN_CONV_PW1,  prefix, il, "weight"));
+                        layer.conv_pw1_b   = get_tensor(string_format(TN_CONV_PW1,  prefix, il, "bias"), false);
+                        layer.conv_dw_w    = get_tensor(string_format(TN_CONV_DW,   prefix, il, "weight"));
+                        layer.conv_dw_b    = get_tensor(string_format(TN_CONV_DW,   prefix, il, "bias"), false);
+                        layer.conv_norm_w  = get_tensor(string_format(TN_NORM_CONV, prefix, il, "weight"), false);
+                        layer.conv_norm_b  = get_tensor(string_format(TN_NORM_CONV, prefix, il, "bias"), false);
+                        layer.conv_pw2_w   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "weight"));
+                        layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "bias"), false);
+
+                        // FFN2 (second half-step)
+                        layer.ff_norm_1_w      = get_tensor(string_format(TN_FFN_NORM_1, prefix, il, "weight"));
+                        layer.ff_up_1_w        = get_tensor(string_format(TN_FFN_UP_1, prefix, il, "weight"));
+                        layer.ff_up_1_b        = get_tensor(string_format(TN_FFN_UP_1, prefix, il, "bias"), false);
+                        layer.ff_down_1_w      = get_tensor(string_format(TN_FFN_DOWN_1, prefix, il, "weight"));
+                        layer.ff_down_1_b      = get_tensor(string_format(TN_FFN_DOWN_1, prefix, il, "bias"), false);
+                        layer.ff_post_norm_1_w = get_tensor(string_format(TN_A_FFN_POST_NORM_1, prefix, il, "weight"), false);
+                    }
+
+                    // Load clamp info for ClippableLinear AFTER all tensors are loaded
+                    for (auto * tensor : tensors_to_load) {
+                        std::string name = tensor->name;
+                        if (string_ends_with(name, ".weight")) {
+                            std::string name_inp_max = name;
+                            std::string name_inp_min = name;
+                            std::string name_out_max = name;
+                            std::string name_out_min = name;
+                            string_replace_all(name_inp_max, ".weight", ".input_max");
+                            string_replace_all(name_inp_min, ".weight", ".input_min");
+                            string_replace_all(name_out_max, ".weight", ".output_max");
+                            string_replace_all(name_out_min, ".weight", ".output_min");
+                            model.clamp_info_map[name] = {
+                                get_scalar(name_inp_max, FLT_MAX),
+                                get_scalar(name_inp_min, -FLT_MAX),
+                                get_scalar(name_out_max, FLT_MAX),
+                                get_scalar(name_out_min, -FLT_MAX)
+                            };
+                        }
+                    }
+                } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");
         }
@@ -2041,11 +2188,6 @@ struct clip_model_loader {
         // load data
         {
             std::vector<uint8_t> read_buf;
-
-            auto fin = std::ifstream(fname, std::ios::binary);
-            if (!fin) {
-                throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
-            }
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
@@ -2581,6 +2723,7 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                 n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
@@ -2677,6 +2820,16 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_LFM2A:
             {
                 n_patches = ((((img->nx + 1) / 2) + 1) / 2 + 1) / 2;
+            } break;
+        case PROJECTOR_TYPE_GEMMA4A:
+            {
+                // Two Conv2D stride-2: O = floor((I + 2p - k) / s) + 1, p=1, k=3, s=2
+                // O = floor((I - 1) / 2) + 1
+                int n = img->nx;
+                for (int i = 0; i < 2; i++) {
+                    n = (n - 1) / 2 + 1;
+                }
+                n_patches = n;
             } break;
         default:
             GGML_ABORT("unsupported projector type");
@@ -3031,6 +3184,18 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 }
                 set_input_i32("patches", patches);
             } break;
+        case PROJECTOR_TYPE_GEMMA4V:
+            {
+                // set (col, row) patch positions for learned positional embedding
+                const int n_cols = image_size_width  / patch_size;
+                std::vector<int32_t> pos_x(num_patches), pos_y(num_patches);
+                for (int i = 0; i < num_patches; i++) {
+                    pos_x[i] = i % n_cols;
+                    pos_y[i] = i / n_cols;
+                }
+                set_input_i32("pos_x", pos_x);
+                set_input_i32("pos_y", pos_y);
+            } break;
         case PROJECTOR_TYPE_DEEPSEEKOCR:
             {
                 GGML_ASSERT(pos_w == pos_h);
@@ -3088,6 +3253,56 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                     pos_data[i] = (i % n_patches_per_col) + 1;
                 }
                 set_input_i32("pos_w", pos_data);
+            } break;
+        case PROJECTOR_TYPE_GEMMA4A:
+            {
+                GGML_ASSERT(imgs.entries.size() == 1);
+                const auto & img0 = imgs.entries.front();
+                // Compute n_pos matching SSCP output: two stride-2 convs
+                int n_pos_a = img0->nx;
+                for (int i = 0; i < 2; i++) { n_pos_a = (n_pos_a - 1) / 2 + 1; }
+
+                // Chunked local attention: blocked causal mask and RPE
+                const int chunk_size   = 12;
+                const int max_past     = 12;
+                const int context_size = chunk_size + max_past;
+                const int num_blocks   = (n_pos_a + chunk_size - 1) / chunk_size;
+
+                // Blocked causal attention mask: [context_size, chunk_size, num_blocks]
+                {
+                    std::vector<float> mask(context_size * chunk_size * num_blocks, -1e9f);
+                    for (int b = 0; b < num_blocks; b++) {
+                        for (int q = 0; q < chunk_size; q++) {
+                            int gq = b * chunk_size + q;
+                            for (int k = 0; k < context_size; k++) {
+                                int gk = b * chunk_size - max_past + k;
+                                if (gq < n_pos_a && gk >= 0 && gk < n_pos_a && gk <= gq && (gq - gk) < max_past) {
+                                    mask[k + q * context_size + b * context_size * chunk_size] = 0.0f;
+                                }
+                            }
+                        }
+                    }
+                    set_input_f32("kq_mask", mask);
+                }
+
+                // Sinusoidal RPE: 13 positions [12, 11, ..., 0]
+                {
+                    const int n_embd = ctx->model.hparams.n_embd;
+                    const int num_timescales = n_embd / 2;
+                    const float log_timescale_increment = logf(10000.0f) / std::max(num_timescales - 1, 1);
+                    const int rpe_len = max_past + 1;
+                    std::vector<float> pos_emb(n_embd * rpe_len, 0.0f);
+                    for (int p = 0; p < rpe_len; p++) {
+                        float position = (float)(max_past - p);
+                        for (int i = 0; i < num_timescales; i++) {
+                            float inv_ts = expf(-(float)i * log_timescale_increment);
+                            float scaled = position * inv_ts;
+                            pos_emb[p * n_embd + i]                 = sinf(scaled);
+                            pos_emb[p * n_embd + i + num_timescales] = cosf(scaled);
+                        }
+                    }
+                    set_input_f32("pos_emb", pos_emb);
+                }
             } break;
         case PROJECTOR_TYPE_LFM2A:
             {
@@ -3218,6 +3433,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
             return ctx->model.mm_input_proj_w->ne[0];
+        case PROJECTOR_TYPE_GEMMA4V:
+            return ctx->model.mm_input_proj_w->ne[1];
         case PROJECTOR_TYPE_IDEFICS3:
             return ctx->model.mm_fc_w->ne[1];
         case PROJECTOR_TYPE_ULTRAVOX:
@@ -3244,6 +3461,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_fc_w->ne[1];
         case PROJECTOR_TYPE_LFM2A:
             return ctx->model.position_embeddings->ne[0];
+        case PROJECTOR_TYPE_GEMMA4A:
+            return ctx->model.hparams.projection_dim;
         case PROJECTOR_TYPE_GLM4V:
             return ctx->model.mm_ffn_down_w->ne[1];
         default:

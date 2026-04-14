@@ -399,6 +399,13 @@ struct mtmd_context {
                     img_end = "\n"; // prevent empty batch on llama-server
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_GEMMA4V:
+                {
+                    // <|image> ... (image embeddings) ... <image|>
+                    img_beg = "<|image>";
+                    img_end = "<image|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected vision projector type %d\n", __func__, proj));
         }
@@ -445,6 +452,12 @@ struct mtmd_context {
             case PROJECTOR_TYPE_LFM2A:
                 {
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_conformer>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_GEMMA4A:
+                {
+                    aud_beg = "<|audio>";
+                    aud_end = "<audio|>";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_gemma4a>(ctx_a);
                 } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected audio projector type %d\n", __func__, proj));
@@ -974,6 +987,7 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
     switch (ctx->proj_type_v()) {
         case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_GEMMA4V:
             return true;
         default:
             return false;

@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <cinttypes>
 #include <string>
+#include <string_view>
 #include <map>
 #include <sstream>
 #include <vector>
@@ -88,8 +89,11 @@
 #define TN_FFN_GATE        "%s.blk.%d.ffn_gate.%s"
 #define TN_LN_1            "%s.blk.%d.ln1.%s" // layer norm
 #define TN_LN_2            "%s.blk.%d.ln2.%s" // layer norm
-#define TN_LS_1            "%s.blk.%d.ls1.%s" // layer scale
-#define TN_LS_2            "%s.blk.%d.ls2.%s" // layer scale
+#define TN_LS_1            "%s.blk.%d.ls1.%s"         // layer scale
+#define TN_LS_2            "%s.blk.%d.ls2.%s"         // layer scale
+#define TN_LS_OUT          "%s.blk.%d.out_scale.%s"      // layer out scale (gemma4)
+#define TN_ATTN_POST_NORM  "%s.blk.%d.attn_post_norm.%s" // post-attn norm (gemma4)
+#define TN_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"  // post-FFN norm (gemma4)
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
@@ -173,6 +177,21 @@
 #define TN_CONV_PW1        "%s.blk.%d.conv_pw1.%s"
 #define TN_CONV_PW2        "%s.blk.%d.conv_pw2.%s"
 
+// gemma4 audio conformer
+#define TN_A_MM_INP_PROJ     "mm.a.input_projection.%s"
+#define TN_A_MM_SOFT_EMB_N   "mm.a.soft_emb_norm.%s"
+#define TN_A_INP_PROJ        "a.input_projection.%s"
+#define TN_A_CONV1D          "a.conv1d.%d.%s"
+#define TN_A_CONV1D_NORM     "a.conv1d.%d.norm.%s"
+#define TN_A_OUT_PROJ        "a.pre_encode.out.%s"
+#define TN_A_ATTN_PRE_NORM   "%s.blk.%d.attn_pre_norm.%s"
+#define TN_A_ATTN_POST_NORM  "%s.blk.%d.attn_post_norm.%s"
+#define TN_A_ATTN_K_REL      "%s.blk.%d.attn_k_rel.%s"
+#define TN_A_PER_DIM_SCALE   "%s.blk.%d.per_dim_scale.%s"
+#define TN_A_PER_DIM_K_SCALE "%s.blk.%d.per_dim_k_scale.%s"
+#define TN_A_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"
+#define TN_A_FFN_POST_NORM_1 "%s.blk.%d.ffn_post_norm_1.%s"
+
 // mobilenetv5 (gemma3n) definitions
 #define TN_MNV5_STEM_CONV        "v.conv_stem.conv.weight"
 #define TN_MNV5_STEM_BIAS        "v.conv_stem.conv.bias"
@@ -213,6 +232,10 @@
 #define TN_MNV5_MSFA_FFN_PROJ_BN "v.msfa.ffn.pw_proj.bn.weight"
 #define TN_MNV5_MSFA_NORM        "v.msfa.norm.weight"
 
+// gemma4
+#define TN_STD_BIAS              "v.std_bias"
+#define TN_STD_SCALE             "v.std_scale"
+
 
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
@@ -233,6 +256,8 @@ enum projector_type {
     PROJECTOR_TYPE_GEMMA3,
     PROJECTOR_TYPE_GEMMA3NV,
     PROJECTOR_TYPE_GEMMA3NA,
+    PROJECTOR_TYPE_GEMMA4V,
+    PROJECTOR_TYPE_GEMMA4A,
     PROJECTOR_TYPE_PHI4,
     PROJECTOR_TYPE_IDEFICS3,
     PROJECTOR_TYPE_PIXTRAL,
@@ -272,6 +297,8 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GEMMA3,    "gemma3"},
     { PROJECTOR_TYPE_GEMMA3NV,  "gemma3nv"},
     { PROJECTOR_TYPE_GEMMA3NA,  "gemma3na"},
+    { PROJECTOR_TYPE_GEMMA4V,   "gemma4v"},
+    { PROJECTOR_TYPE_GEMMA4A,   "gemma4a"},
     { PROJECTOR_TYPE_PHI4,      "phi4"},
     { PROJECTOR_TYPE_IDEFICS3,  "idefics3"},
     { PROJECTOR_TYPE_PIXTRAL,   "pixtral"},
@@ -443,6 +470,18 @@ static std::string string_format(const char * fmt, ...) {
     va_end(ap2);
     va_end(ap);
     return std::string(buf.data(), buf.size());
+}
+
+// remove when moving to c++20
+inline bool string_starts_with(std::string_view str, std::string_view prefix) {
+    return str.size() >= prefix.size() &&
+           str.compare(0, prefix.size(), prefix) == 0;
+}
+
+// remove when moving to c++20
+inline bool string_ends_with(std::string_view str, std::string_view suffix) {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 static void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {

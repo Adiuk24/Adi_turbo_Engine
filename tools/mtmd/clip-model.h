@@ -5,6 +5,7 @@
 #include "clip-impl.h"
 
 #include <array>
+#include <map>
 #include <vector>
 #include <unordered_set>
 #include <cstdint>
@@ -159,6 +160,8 @@ struct clip_layer {
     ggml_tensor * k_norm = nullptr;
     ggml_tensor * q_norm = nullptr;
 
+    ggml_tensor * attn_post_norm_w = nullptr;
+
     // layernorm 1
     ggml_tensor * ln_1_w = nullptr;
     ggml_tensor * ln_1_b = nullptr;
@@ -174,9 +177,12 @@ struct clip_layer {
     ggml_tensor * ln_2_w = nullptr;
     ggml_tensor * ln_2_b = nullptr;
 
+    ggml_tensor * ff_post_norm_w = nullptr;
+
     // layer scale (no bias)
-    ggml_tensor * ls_1_w = nullptr;
-    ggml_tensor * ls_2_w = nullptr;
+    ggml_tensor * ls_1_w   = nullptr;
+    ggml_tensor * ls_2_w   = nullptr;
+    ggml_tensor * ls_out_w = nullptr; // gemma4
 
     // qwen3vl deepstack merger
     ggml_tensor * deepstack_norm_w = nullptr;
@@ -212,6 +218,13 @@ struct clip_layer {
     ggml_tensor * conv_pw1_b    = nullptr;
     ggml_tensor * conv_pw2_w    = nullptr;
     ggml_tensor * conv_pw2_b    = nullptr;
+
+    // gemma4 audio conformer per-layer
+    ggml_tensor * attn_pre_norm_w   = nullptr;
+    ggml_tensor * attn_k_rel_w      = nullptr;
+    ggml_tensor * per_dim_scale_w   = nullptr;
+    ggml_tensor * per_dim_k_scale_w = nullptr;
+    ggml_tensor * ff_post_norm_1_w  = nullptr;
 
     bool has_deepstack() const {
         return deepstack_fc1_w != nullptr;
@@ -436,6 +449,27 @@ struct clip_model {
     std::array<ggml_tensor *, 7> pre_encode_conv_X_b = {nullptr};
     ggml_tensor * pre_encode_out_w = nullptr;
     ggml_tensor * pre_encode_out_b = nullptr;
+
+    // gemma4
+    ggml_tensor * std_bias = nullptr;
+    ggml_tensor * std_scale = nullptr;
+    // Gemma4ClippableLinear
+    struct clamp_info {
+        float inp_max;
+        float inp_min;
+        float out_max;
+        float out_min;
+    };
+    std::map<std::string, clamp_info> clamp_info_map;
+
+    // gemma4 audio conformer
+    std::array<ggml_tensor *, 2> sscp_conv_w = {nullptr};
+    std::array<ggml_tensor *, 2> sscp_conv_b = {nullptr};
+    std::array<ggml_tensor *, 2> sscp_norm_w = {nullptr};
+    ggml_tensor * sscp_inp_proj_w = nullptr;
+    ggml_tensor * sscp_inp_proj_b = nullptr;
+    ggml_tensor * audio_out_proj_w = nullptr;
+    ggml_tensor * audio_out_proj_b = nullptr;
 
     bool audio_has_avgpool() const {
         return proj_type == PROJECTOR_TYPE_QWEN2A
