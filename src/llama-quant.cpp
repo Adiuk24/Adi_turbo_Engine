@@ -494,108 +494,59 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 ||
                ftype == LLAMA_FTYPE_MOSTLY_TQ3_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ4_0) {
-        // MoE-aware per-tensor routing for TQ types.
-        // Without this, MoE gate/attention tensors get flat ternary which destroys routing.
-        // Mirrors the IQ2 logic below but uses Q4_K/Q5_K for sensitive tensors.
-        const bool dense_tq4 = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0 && qs.model.hparams.n_expert == 0;
-        const bool dense_tq3 = ftype == LLAMA_FTYPE_MOSTLY_TQ3_0 && qs.model.hparams.n_expert == 0;
-        const bool dense_tq2 = (ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ1_0) && qs.model.hparams.n_expert == 0;
+        // Ultra-aggressive TQ routing for AdiTurbo — everything gets TQ baseline.
+        // MoE expert tensors included — AdiTurbo's whole point is extreme compression.
+        // Only exception: MoE router gate (ffn_gate_inp) stays Q4_K to preserve routing.
+        const bool is_tq4 = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0;
+        const bool is_tq3 = ftype == LLAMA_FTYPE_MOSTLY_TQ3_0;
+        const bool is_moe = qs.model.hparams.n_expert >= 4;
         if (category_is_attn_v(category)) {
-            if (dense_tq2) {
-                // Dense TQ2_0/TQ1_0: attention V is critical — must keep at Q4_K minimum.
-                new_type = GGML_TYPE_Q4_K;
-            } else if (dense_tq4) {
-                new_type = GGML_TYPE_Q5_K;
-            } else if (dense_tq3) {
-                // Dense TQ3_0: preserve attention quality to close gap with Q3_K_S.
-                new_type = GGML_TYPE_Q4_K;
-            } else if (ftype == LLAMA_FTYPE_MOSTLY_TQ4_0) {
-                new_type = GGML_TYPE_Q4_K;
-            } else if (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) {
-                new_type = GGML_TYPE_Q4_K;
-            } else {
-                new_type = GGML_TYPE_Q3_K;
-            }
+            // Attention V: one step above baseline for quality
+            new_type = is_tq4 ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_K;
             if (tensor->ne[0] % ggml_blck_size(new_type) != 0) {
-                // Q4_K/Q3_K have 256-wide blocks; route odd-width attn_v directly.
                 new_type = GGML_TYPE_Q5_0;
             }
             ++qs.i_attention_wv;
         }
-        else if ((dense_tq4 || dense_tq3 || dense_tq2) && category == tensor_category::ATTENTION_Q) {
-            new_type = tensor->ne[0] % ggml_blck_size(GGML_TYPE_Q4_K) == 0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_0;
-        }
-        else if ((dense_tq4 || dense_tq3 || dense_tq2) && category == tensor_category::ATTENTION_K) {
-            new_type = tensor->ne[0] % ggml_blck_size(GGML_TYPE_Q4_K) == 0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_0;
-        }
-        else if (qs.model.hparams.n_expert >= 4 && category == tensor_category::ATTENTION_K) {
-            new_type = GGML_TYPE_Q4_K;
-        }
         else if (category == tensor_category::ATTENTION_OUTPUT) {
-            if (dense_tq2) {
-                new_type = GGML_TYPE_Q4_K;
-            } else if (dense_tq4) {
-                new_type = GGML_TYPE_Q8_0;
-            } else if (dense_tq3) {
-                new_type = GGML_TYPE_Q5_K;
-            } else if (qs.model.hparams.n_expert >= 4) {
-                new_type = GGML_TYPE_Q5_K;
-            }
+            // Attention output: one step above baseline
+            new_type = is_tq4 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
         }
         else if (category == tensor_category::FFN_GATE) {
-            // MoE gate tensors (ffn_gate_inp) are critical for expert routing.
-            // Must preserve precision — flat ternary here destroys routing entirely.
-            if (dense_tq4) {
-                new_type = GGML_TYPE_Q8_0;
-            } else if (qs.model.hparams.n_expert >= 4) {
-                new_type = GGML_TYPE_Q8_0;
+            // Distinguish MoE router (ffn_gate_inp) from expert weights (ffn_gate_up_exps)
+            // and shared expert gate (ffn_gate). Only the router needs higher precision.
+            const bool is_router = name.find("ffn_gate_inp") != std::string::npos;
+            if (is_moe && is_router) {
+                // MoE router — must preserve precision for expert selection
+                new_type = GGML_TYPE_Q4_K;
+            } else if (tensor->ne[0] % 256 != 0) {
+                // Shared gate with dims not divisible by 256 (e.g. 2112)
+                new_type = is_tq4 ? GGML_TYPE_IQ4_XS : GGML_TYPE_IQ3_XXS;
             }
             ++qs.i_ffn_gate;
         }
         else if (category == tensor_category::FFN_DOWN) {
-            if (dense_tq2) {
-                // TQ2_0: edge layers (first/last 1/4) at Q3_K for quality stability.
-                const bool edge_layer = qs.i_ffn_down < qs.n_ffn_down/4 || qs.i_ffn_down >= 3*qs.n_ffn_down/4;
-                if (edge_layer) {
-                    new_type = GGML_TYPE_Q3_K;
-                }
-            } else if (dense_tq4) {
-                const bool edge_layer = qs.i_ffn_down < qs.n_ffn_down/4 || qs.i_ffn_down >= 3*qs.n_ffn_down/4;
-                new_type = edge_layer ? GGML_TYPE_Q8_0 : GGML_TYPE_Q5_0;
-            } else if (dense_tq3) {
-                const bool edge_layer = qs.i_ffn_down < qs.n_ffn_down/8 || qs.i_ffn_down >= 7*qs.n_ffn_down/8;
-                if (edge_layer) {
-                    new_type = GGML_TYPE_Q4_K;
-                }
-            } else {
-                if (tensor->ne[0] % 256 != 0) {
-                    new_type = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0 ? GGML_TYPE_Q4_0 : GGML_TYPE_IQ4_NL;
-                }
-                if (qs.i_ffn_down < qs.n_ffn_down/8) {
-                    new_type = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K;
-                }
+            const bool edge = qs.i_ffn_down < qs.n_ffn_down/8 || qs.i_ffn_down >= 7*qs.n_ffn_down/8;
+            if (edge && !is_moe) {
+                new_type = is_tq4 ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_K;
+            } else if (tensor->ne[0] % 256 != 0) {
+                // Expert/shared FFN with dims not divisible by 256 (e.g. 704, 2112):
+                // Use IQ3_XXS (block_size=32) instead of falling back to IQ4_NL
+                new_type = is_tq4 ? GGML_TYPE_IQ4_XS : GGML_TYPE_IQ3_XXS;
             }
             ++qs.i_ffn_down;
         }
         else if (category == tensor_category::FFN_UP) {
-            if (dense_tq2) {
-                const bool edge_layer = qs.i_ffn_up < qs.n_ffn_up/4 || qs.i_ffn_up >= 3*qs.n_ffn_up/4;
-                if (edge_layer) {
-                    new_type = GGML_TYPE_Q3_K;
-                }
-            } else if (dense_tq4) {
-                const bool edge_layer = qs.i_ffn_up < qs.n_ffn_up/4 || qs.i_ffn_up >= 3*qs.n_ffn_up/4;
-                new_type = edge_layer ? GGML_TYPE_Q8_0 : GGML_TYPE_Q5_0;
-            } else if (dense_tq3) {
-                const bool edge_layer = qs.i_ffn_up < qs.n_ffn_up/8 || qs.i_ffn_up >= 7*qs.n_ffn_up/8;
-                if (edge_layer) {
-                    new_type = GGML_TYPE_Q4_K;
-                }
+            const bool edge = qs.i_ffn_up < qs.n_ffn_up/8 || qs.i_ffn_up >= 7*qs.n_ffn_up/8;
+            if (edge && !is_moe) {
+                new_type = is_tq4 ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_K;
             } else if (tensor->ne[0] % 256 != 0) {
-                new_type = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0 ? GGML_TYPE_Q4_0 : GGML_TYPE_IQ4_NL;
+                new_type = is_tq4 ? GGML_TYPE_IQ4_XS : GGML_TYPE_IQ3_XXS;
             }
             ++qs.i_ffn_up;
         }
+        // All other tensors (expert weights, attention Q/K, ffn_gate for dense):
+        // stay at baseline TQ type — no override needed
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
                ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
         if (category_is_attn_v(category)) {
@@ -814,7 +765,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         if (ggml_is_quantized(new_type) && ncols % ggml_blck_size(new_type) != 0) {
             const ggml_type routed =
                 new_type == GGML_TYPE_TQ4_0 ? GGML_TYPE_Q4_0 :
-                new_type == GGML_TYPE_TQ3_0 ? GGML_TYPE_TQ3_S :
+                new_type == GGML_TYPE_TQ3_0 ? GGML_TYPE_IQ3_XXS :
                 new_type == GGML_TYPE_TQ2_0 ? GGML_TYPE_Q4_0 :
                 new_type == GGML_TYPE_TQ1_0 ? GGML_TYPE_Q4_0 :
                 GGML_TYPE_COUNT;
