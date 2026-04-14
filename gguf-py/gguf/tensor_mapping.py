@@ -1891,6 +1891,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_ENC_PER_DIM_SCALE: (
             "conformer.layers.{bid}.attention.attn.per_dim_scale", # gemma3n
+            "conformer.layers.{bid}.self_attn.per_dim_scale", # gemma3n
         ),
 
         MODEL_TENSOR.A_ENC_LAYER_PRE_NORM: (
@@ -1924,6 +1925,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_ENC_FFN_POST_NORM: (
             "conformer.layers.{bid}.ffw_layer_start.post_layer_norm", # gemma3n
+            "conformer.layers.{bid}.feed_forward1.post_layer_norm", # gemma4
         ),
 
         MODEL_TENSOR.A_ENC_FFN_SCALE: (
@@ -1934,6 +1936,7 @@ class TensorNameMap:
             "audio_tower.layers.{bid}.fc1", # ultravox
             "conformer.layers.{bid}.feed_forward1.linear1", # lfm2
             "conformer.layers.{bid}.ffw_layer_start.ffw_layer_1", # gemma3n
+            "conformer.layers.{bid}.feed_forward1.ffw_layer_1", # gemma4
         ),
 
         MODEL_TENSOR.A_ENC_FFN_GATE: (),
@@ -1942,25 +1945,30 @@ class TensorNameMap:
             "audio_tower.layers.{bid}.fc2", # ultravox
             "conformer.layers.{bid}.feed_forward1.linear2", # lfm2
             "conformer.layers.{bid}.ffw_layer_start.ffw_layer_2", # gemma3n
+            "conformer.layers.{bid}.feed_forward1.ffw_layer_2", # gemma4
         ),
 
         MODEL_TENSOR.A_ENC_FFN_UP_1: (
             "conformer.layers.{bid}.feed_forward2.linear1", # lfm2
             "conformer.layers.{bid}.ffw_layer_end.ffw_layer_1", # gemma3n
+            "conformer.layers.{bid}.feed_forward2.ffw_layer_1", # gemma4
         ),
 
         MODEL_TENSOR.A_ENC_FFN_DOWN_1: (
             "conformer.layers.{bid}.feed_forward2.linear2", # lfm2
             "conformer.layers.{bid}.ffw_layer_end.ffw_layer_2", # gemma3n
+            "conformer.layers.{bid}.feed_forward2.ffw_layer_2", # gemma4
         ),
 
         MODEL_TENSOR.A_ENC_FFN_NORM_1: (
             "conformer.layers.{bid}.norm_feed_forward2", # lfm2
             "conformer.layers.{bid}.ffw_layer_end.pre_layer_norm", # gemma3n
+            "conformer.layers.{bid}.feed_forward2.pre_layer_norm", # gemma4
         ),
 
         MODEL_TENSOR.A_ENC_FFN_POST_NORM_1: (
             "conformer.layers.{bid}.ffw_layer_end.post_layer_norm", # gemma3n
+            "conformer.layers.{bid}.feed_forward2.post_layer_norm", # gemma4
         ),
 
         MODEL_TENSOR.A_ENC_FFN_SCALE_1: (
@@ -1982,7 +1990,8 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_ENC_OUT: (
             "conformer.pre_encode.out", # lfm2
-            "model.audio_tower.subsample_conv_projection.input_proj_linear", # gemma3n
+            "model.audio_tower.subsample_conv_projection.input_proj_linear", # gemma3n (note: it should be A_ENC_INP_PROJ, this is a mistake; it should be corrected in C++ code when it's supported)
+            "conformer.output_proj", # gemma4
         ),
 
         # note: some tensors below has "audio." pseudo-prefix, to prevent conflicts with vision tensors
@@ -1996,6 +2005,7 @@ class TensorNameMap:
         MODEL_TENSOR.A_MMPROJ_FC: (
             "audio.multi_modal_projector.linear", # qwen2audio
             "audio_tower.proj", # qwen2omni
+            "model.audio_tower.output_proj", # gemma4
         ),
 
         MODEL_TENSOR.A_MM_NORM_PRE: (
@@ -2042,6 +2052,14 @@ class TensorNameMap:
         ),
         MODEL_TENSOR.A_MM_SOFT_EMB_NORM: (
             "model.embed_audio.soft_embedding_norm", # gemma3n
+        ),
+
+        MODEL_TENSOR.A_PER_DIM_K_SCALE: (
+            "conformer.layers.{bid}.attention.attn.per_dim_key_scale", # gemma4
+        ),
+
+        MODEL_TENSOR.A_PER_DIM_SCALE: (
+            "conformer.layers.{bid}.attention.attn.per_dim_scale", # gemma4
         ),
 
         # NextN/MTP tensors
