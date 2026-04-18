@@ -14,6 +14,8 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <set>
+#include <vector>
 
 //
 // llama_context
@@ -2073,7 +2075,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    uint32_t res = std::max<uint32_t>(2048u, 32u*model.n_tensors());
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
@@ -2126,6 +2128,7 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
 
     this->n_outputs = save_n_outputs;
 
@@ -2667,7 +2670,9 @@ std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> llama_context:
 //
 
 static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
-    if (!tensor || tensor->type != GGML_TYPE_F32) {
+    if (!tensor) return;
+    if (tensor->type != GGML_TYPE_F32) {
+        // LLAMA_LOG_DEBUG("%s: skipping tensor '%s' because type is %s (not F32)\n", __func__, tensor->name, ggml_type_name(tensor->type));
         return;
     }
     if (!param_filter(tensor, userdata)) {
@@ -2679,6 +2684,7 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
     if (strcmp(tensor->name, "rope_freqs.weight") == 0) {
         return; // FIXME
     }
+    printf("%s: marking tensor '%s' as trainable parameter\n", __func__, tensor->name);
     ggml_set_param(tensor);
 }
 
@@ -2690,37 +2696,64 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    this->ctx_teacher = lopt_params.ctx_teacher;
+    this->distill_temp = lopt_params.distill_temperature;
+
+    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), 
+        this->ctx_teacher ? GGML_OPT_LOSS_TYPE_KLD : GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
+    opt_params.distill_temp     = lopt_params.distill_temperature;
     opt_ctx = ggml_opt_init(opt_params);
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
 
-  //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
-    llama_set_param(model->type_embd,       param_filter, param_filter_ud);
-    llama_set_param(model->pos_embd,        param_filter, param_filter_ud);
-    llama_set_param(model->tok_norm,        param_filter, param_filter_ud);
-    llama_set_param(model->tok_norm_b,      param_filter, param_filter_ud);
-    llama_set_param(model->output_norm,     param_filter, param_filter_ud);
-    llama_set_param(model->output_norm_b,   param_filter, param_filter_ud);
-    llama_set_param(model->output,          param_filter, param_filter_ud);
-    llama_set_param(model->output_b,        param_filter, param_filter_ud);
-    llama_set_param(model->output_norm_enc, param_filter, param_filter_ud);
-    llama_set_param(model->cls,             param_filter, param_filter_ud);
-    llama_set_param(model->cls_b,           param_filter, param_filter_ud);
-    llama_set_param(model->cls_out,         param_filter, param_filter_ud);
-    llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
-    llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
+    uint32_t n_params = 0;
+    auto count_param = [&](struct ggml_tensor * tensor) {
+        if (tensor && (tensor->flags & GGML_TENSOR_FLAG_PARAM)) {
+            n_params++;
+        }
+    };
+
+    fprintf(stderr, "%s: model->loras.size() = %zu\n", __func__, model->loras.size());
+
+    //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
+    llama_set_param(model->type_embd,       param_filter, param_filter_ud); count_param(model->type_embd);
+    llama_set_param(model->pos_embd,        param_filter, param_filter_ud); count_param(model->pos_embd);
+    llama_set_param(model->tok_norm,        param_filter, param_filter_ud); count_param(model->tok_norm);
+    llama_set_param(model->tok_norm_b,      param_filter, param_filter_ud); count_param(model->tok_norm_b);
+    llama_set_param(model->output_norm,     param_filter, param_filter_ud); count_param(model->output_norm);
+    llama_set_param(model->output_norm_b,   param_filter, param_filter_ud); count_param(model->output_norm_b);
+    llama_set_param(model->output,          param_filter, param_filter_ud); count_param(model->output);
+    llama_set_param(model->output_b,        param_filter, param_filter_ud); count_param(model->output_b);
+    llama_set_param(model->output_norm_enc, param_filter, param_filter_ud); count_param(model->output_norm_enc);
+    llama_set_param(model->cls,             param_filter, param_filter_ud); count_param(model->cls);
+    llama_set_param(model->cls_b,           param_filter, param_filter_ud); count_param(model->cls_b);
+    llama_set_param(model->cls_out,         param_filter, param_filter_ud); count_param(model->cls_out);
+    llama_set_param(model->cls_out_b,       param_filter, param_filter_ud); count_param(model->cls_out_b);
+    llama_set_param(model->cls_norm,        param_filter, param_filter_ud); count_param(model->cls_norm);
 
     for (struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
-            llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
+            struct ggml_tensor * t = reinterpret_cast<struct ggml_tensor **>(&layer)[i];
+            llama_set_param(t, param_filter, param_filter_ud);
+            count_param(t);
         }
     }
+
+    for (auto * lora_adapter : model->loras) {
+        fprintf(stderr, "%s: processing lora adapter with %zu tensors\n", __func__, lora_adapter->ab_map.size());
+        for (auto & it : lora_adapter->ab_map) {
+            fprintf(stderr, "%s: checking LoRA pair for base tensor '%s'\n", __func__, it.first.c_str());
+            llama_set_param(it.second.a, param_filter, param_filter_ud); count_param(it.second.a);
+            llama_set_param(it.second.b, param_filter, param_filter_ud); count_param(it.second.b);
+        }
+    }
+    fprintf(stderr, "%s: set %u parameters for optimization\n", __func__, n_params);
+    fflush(stderr);
 }
 
 void llama_context::opt_epoch_iter(
@@ -2733,13 +2766,17 @@ void llama_context::opt_epoch_iter(
         bool                             train,
         int64_t                          idata_in_loop,
         int64_t                          ndata_in_loop,
-        int64_t                          t_loop_start) {
+        int64_t                          t_loop_start,
+        ggml_backend_buffer_t            buf_inputs) {
     GGML_ASSERT(opt_ctx);
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
     memory->clear(true);
+    if (this->ctx_teacher) {
+        llama_memory_clear(this->ctx_teacher->get_memory(), true);
+    }
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
         batch.n_tokens = n_batch;
@@ -2749,6 +2786,13 @@ void llama_context::opt_epoch_iter(
             batch.n_seq_id[pos_batch]    = 1;
             batch.seq_id  [pos_batch][0] = 0;
             batch.logits  [pos_batch]    = true;
+        }
+
+        if (this->ctx_teacher) {
+            if (llama_decode(this->ctx_teacher, batch) != 0) {
+                LLAMA_LOG_ERROR("%s: teacher failed to decode batch\n", __func__);
+                return;
+            }
         }
 
         if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
@@ -2778,6 +2822,7 @@ void llama_context::opt_epoch_iter(
 
         uint32_t pos_batch = 0;
         do {
+            printf("\nDEBUG: REACHED opt_epoch_iter LOOP\n"); fflush(stdout);
             const auto & ubatch = mctx->get_ubatch();
 
             n_outputs = ubatch.n_tokens;
@@ -2789,23 +2834,28 @@ void llama_context::opt_epoch_iter(
 
             auto * res = gf_res_prev.get();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_DEFAULT);
+            auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_DEFAULT);
+            gparams.cparams.flash_attn = false;
 
-            res->reset();
+            res->reset(true, true); // Virtual Mode (Metadata only)
 
             auto * gf = model.build_graph(gparams);
+            ggml_backend_alloc_ctx_tensors(res->get_ctx(), this->backend_cpu);
 
             struct ggml_context * ctx_compute_opt;
             {
                 const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                const size_t size_opt = size_gf * 16;
+                const size_t size_meta = 64 * size_opt * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(size_opt, /*grads = */ true) + 128*1024*1024; // 128MB padding
                 struct ggml_init_params params = {
                     /*.mem_size   =*/ size_meta,
                     /*.mem_buffer =*/ nullptr,
                     /*.no_alloc   =*/ true,
                 };
                 ctx_compute_opt = ggml_init(params);
+                ggml_backend_alloc_ctx_tensors(ctx_compute_opt, this->backend_cpu);
             }
+
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
@@ -2814,11 +2864,37 @@ void llama_context::opt_epoch_iter(
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
                 ggml_set_zero(labels);
-                const float onef = 1.0f;
-                for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
-                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                
+                if (this->ctx_teacher) {
+                    const float temp = this->distill_temp;
+                    const float * teacher_logits = llama_get_logits(this->ctx_teacher);
+                    const int vocab_size = (int)labels->ne[0];
+                    std::vector<float> teacher_probs(vocab_size * n_ubatch, 0.0f);
+                    
+                    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                        float max_l = -INFINITY;
+                        for (int v = 0; v < vocab_size; v++) {
+                            float l = teacher_logits[i * vocab_size + v] / temp;
+                            if (l > max_l) max_l = l;
+                        }
+                        float sum = 0.0f;
+                        for (int v = 0; v < vocab_size; v++) {
+                            float p = expf(teacher_logits[i * vocab_size + v] / temp - max_l);
+                            teacher_probs[i * vocab_size + v] = p;
+                            sum += p;
+                        }
+                        for (int v = 0; v < vocab_size; v++) {
+                            teacher_probs[i * vocab_size + v] /= sum;
+                        }
+                    }
+                    ggml_backend_tensor_set(labels, teacher_probs.data(), 0, vocab_size * n_ubatch * sizeof(float));
+                } else {
+                    const float onef = 1.0f;
+                    for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
+                        const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                        GGML_ASSERT(labels_sparse[ilabel] < (size_t)labels->ne[0]);
+                        ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    }
                 }
             }
             ggml_opt_eval(opt_ctx, result);
@@ -2855,6 +2931,9 @@ void llama_context::opt_epoch(
 
     int64_t idata = 0;
 
+    // ALLOCATE SHARED TRAINING INPUT BUFFER (6GB Headroom)
+    ggml_backend_buffer_t buf_inputs = ggml_backend_alloc_buffer(this->backend_cpu, 6ULL*1024ULL*1024ULL*1024ULL);
+
     int64_t t_loop_start = ggml_time_us();
     int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
     for (; idata < idata_split; ++idata) {
@@ -2863,7 +2942,7 @@ void llama_context::opt_epoch(
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
-            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start, buf_inputs);
     }
 
     t_loop_start = ggml_time_us();
@@ -2874,8 +2953,12 @@ void llama_context::opt_epoch(
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
-            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start, buf_inputs);
     }
+ 
+    ggml_backend_buffer_free(buf_inputs);
+
+    ggml_backend_buffer_free(buf_inputs);
 
     llama_batch_free(batch);
 }
@@ -3722,6 +3805,17 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
     GGML_UNUSED(tensor);
     GGML_UNUSED(userdata);
     return true;
+}
+
+bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata) {
+    GGML_UNUSED(userdata);
+    if (!tensor || !tensor->name) return false;
+    const char * name = tensor->name;
+    // We only train tensors containing "lora_a" or "lora_b"
+    if (strstr(name, "lora_a") != nullptr || strstr(name, "lora_b") != nullptr) {
+        return true;
+    }
+    return false;
 }
 
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {

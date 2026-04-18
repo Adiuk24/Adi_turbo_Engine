@@ -422,7 +422,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
-    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
+    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE ||
+        op->op == GGML_OP_CPY || op->op == GGML_OP_OUT_PROD || op->op == GGML_OP_MUL_MAT_ID_BACK || op->op == GGML_OP_MUL_MAT_ID_BACK_SRC1 || op->op == GGML_OP_CLAMP_BACK) {
         return true;
     }
 
@@ -432,21 +433,20 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         if (op->src[i] && op->src[i]->buffer &&
             ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
             auto * buf_extra = (ggml::cpu::extra_buffer_type *) op->src[i]->buffer->buft->context;
-            return buf_extra->supports_op(dev, op);
+            if (buf_extra->supports_op(dev, op)) {
+                return true;
+            }
         }
     }
 
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
-            return
-                op->type != GGML_TYPE_IQ3_XXS &&
-                op->type != GGML_TYPE_IQ3_S   &&
-                op->type != GGML_TYPE_IQ2_XXS &&
-                op->type != GGML_TYPE_IQ2_XS  &&
-                op->type != GGML_TYPE_IQ2_S   &&
-                op->type != GGML_TYPE_IQ1_S   &&
-                op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
+        case GGML_OP_OUT_PROD:
+        case GGML_OP_MUL_MAT_ID_BACK:
+        case GGML_OP_MUL_MAT_ID_BACK_SRC1:
+        case GGML_OP_CLAMP_BACK:
+            return true;
         case GGML_OP_MUL_MAT:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         case GGML_OP_SOFT_MAX_BACK: {
@@ -454,18 +454,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 return false;
             }
             float max_bias = 0.0f;
-
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
-
             return max_bias == 0.0f;
         }
         case GGML_OP_IM2COL_BACK:
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
-        case GGML_OP_OUT_PROD:
-            return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
-                src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         default:
             return true;
     }

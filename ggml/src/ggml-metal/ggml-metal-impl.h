@@ -529,6 +529,58 @@ typedef struct {
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
 
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+
+    int32_t  ne20;
+    int32_t  ne21;
+    uint64_t nb21;
+
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_mul_mat_id_back;
+
+typedef struct {
+    int32_t  ne00; // K
+    int32_t  ne01; // N
+    int32_t  ne02; // E
+    uint64_t nb01;
+    uint64_t nb02;
+
+    int32_t  ne11; // S
+    int32_t  ne12; // T
+    uint64_t nb11;
+    uint64_t nb12;
+
+    uint64_t nb21;
+    uint64_t nb22;
+
+    uint64_t nbd1;
+    uint64_t nbd2;
+} ggml_metal_kargs_mul_mat_id_back_src1;
+
+typedef struct {
+    float min;
+    float max;
+    uint32_t n;
+} ggml_metal_kargs_clamp_back;
+
 // NORM
 // RMS_NORM
 typedef struct {

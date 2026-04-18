@@ -1703,6 +1703,205 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+static void ggml_compute_forward_mul_mat_id_back(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * grad = dst->src[0];
+    const struct ggml_tensor * b    = dst->src[1];
+    const struct ggml_tensor * ids  = dst->src[2];
+    const struct ggml_tensor * as   = dst->src[3];
+
+    const int64_t ne00 = grad->ne[0];
+    const int64_t ne01 = grad->ne[1];
+    const int64_t ne02 = grad->ne[2];
+
+    const int64_t ne10 = b->ne[0];
+    const int64_t ne11 = b->ne[1];
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t n_as = dst->ne[2];
+
+    const size_t nb0 = dst->nb[0];
+    const size_t nb1 = dst->nb[1];
+    const size_t nb2 = dst->nb[2];
+
+    const size_t nb00 = grad->nb[0];
+    const size_t nb01 = grad->nb[1];
+    const size_t nb02 = grad->nb[2];
+
+    const size_t nb10 = b->nb[0];
+    const size_t nb11 = b->nb[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    void * wdata_cur = params->wdata;
+
+    int64_t * matrix_row_counts = // [n_as]
+        (int64_t *) incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
+
+    struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
+        (struct mmid_row_mapping *) incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+
+    GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+
+    if (ith == 0) {
+        // initialize matrix_row_counts
+        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+
+        // group grad/b rows by expert matrix
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int64_t iid0 = 0; iid0 < ids->ne[0]; ++iid0) {
+                const int32_t id = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + iid0*ids->nb[0]);
+
+                assert(id >= 0 && id < n_as);
+
+                matrix_rows[id * ids->ne[0] * ids->ne[1] + matrix_row_counts[id]] = (struct mmid_row_mapping) {(int32_t)iid0, (int32_t)iid1};
+                matrix_row_counts[id] += 1;
+            }
+        }
+
+        // zero output tensor (experts gradient)
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // parallelize over experts
+    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+        const int64_t cne1 = matrix_row_counts[cur_a];
+        if (cne1 == 0) continue;
+
+        float * das_cur = (float *) ((char *) dst->data + cur_a * nb2);
+
+        for (int64_t i = 0; i < cne1; ++i) {
+            struct mmid_row_mapping mapping = matrix_rows[cur_a * ids->ne[0] * ids->ne[1] + i];
+            const int64_t iid0 = mapping.i1;
+            const int64_t iid1 = mapping.i2;
+
+            const float * dy = (const float *) ((const char *) grad->data + iid1*nb02 + iid0*nb01);
+            const float * xj = (const float *) ((const char *) b->data    + iid1*nb11);
+
+            // accumulation: das[col, row] += dy[row] * xj[col]
+            // dst is [n, k, n_experts], so ne0=n, ne1=k
+            for (int64_t row = 0; row < ne1; ++row) {
+                float val_dy = dy[row];
+                float * das_row = (float *) ((char *) das_cur + row * nb1);
+                for (int64_t col = 0; col < ne0; ++col) {
+                    das_row[col] += val_dy * xj[col];
+                }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_mul_mat_id_back_src1(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * grad = dst->src[0];
+    const struct ggml_tensor * src0 = dst->src[1]; // experts
+    const struct ggml_tensor * ids  = dst->src[2];
+
+    const int64_t ne00 = src0->ne[0]; // K
+    const int64_t ne01 = src0->ne[1]; // N
+    const int64_t ne02 = src0->ne[2]; // E
+
+    const int64_t ne10 = grad->ne[0]; // N
+    const int64_t ne11 = grad->ne[1]; // S
+    const int64_t ne12 = grad->ne[2]; // T
+
+    const size_t nb00 = src0->nb[0];
+    const size_t nb01 = src0->nb[1];
+    const size_t nb02 = src0->nb[2];
+
+    const size_t nb10 = grad->nb[0];
+    const size_t nb11 = grad->nb[1];
+    const size_t nb12 = grad->nb[2];
+
+    const size_t nbd0 = dst->nb[0];
+    const size_t nbd1 = dst->nb[1];
+    const size_t nbd2 = dst->nb[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const enum ggml_type type = src0->type;
+    const ggml_to_float_t to_float = ggml_get_type_traits(type)->to_float;
+
+    // Parallelize over (s, t)
+    const int64_t n_st = ne11 * ne12;
+    const int64_t i_st_start = (n_st * ith) / nth;
+    const int64_t i_st_end   = (n_st * (ith + 1)) / nth;
+
+    float w_tmp[256]; // buffer for dequantizing chunks
+    GGML_ASSERT(ne00 % ggml_blck_size(type) == 0);
+
+    for (int64_t i_st = i_st_start; i_st < i_st_end; ++i_st) {
+        const int64_t s = i_st % ne11;
+        const int64_t t = i_st / ne11;
+
+        const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + s*ids->nb[0]);
+        GGML_ASSERT(e >= 0 && e < ne02);
+
+        float * dst_col = (float *) ((char *) dst->data + t*nbd2 + s*nbd1);
+        const float * grad_col = (const float *) ((const char *) grad->data + t*nb12 + s*nb11);
+
+        // zero dst_col
+        memset(dst_col, 0, ne00 * sizeof(float));
+
+        for (int64_t n = 0; n < ne01; ++n) {
+            const float g = grad_col[n];
+            if (g == 0.0f) continue;
+
+            const char * w_row = (const char *) src0->data + e*nb02 + n*nb01;
+
+            if (type == GGML_TYPE_F32) {
+                ggml_vec_mad_f32(ne00, dst_col, (const float *) w_row, g);
+            } else {
+                // dequantize in chunks
+                const int64_t bs = ggml_blck_size(type);
+                const size_t t_size = ggml_type_size(type);
+                for (int64_t k = 0; k < ne00; k += 256) {
+                    const int64_t dk = MIN(256, ne00 - k);
+                    to_float(w_row + (k/bs)*t_size, w_tmp, dk);
+                    ggml_vec_mad_f32(dk, dst_col + k, w_tmp, g);
+                }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_clamp_back(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * grad = dst->src[0];
+    const struct ggml_tensor * src0 = dst->src[1];
+    float min;
+    float max;
+    memcpy(&min, dst->op_params, sizeof(float));
+    memcpy(&max, (char *)dst->op_params + sizeof(float), sizeof(float));
+
+    const int n = ggml_nelements(dst);
+
+    // Supporting F32 for now
+    if (dst->type == GGML_TYPE_F32) {
+        float * d = (float *) dst->data;
+        const float * g = (float *) grad->data;
+        const float * s = (float *) src0->data;
+
+        for (int i = 0; i < n; ++i) {
+            d[i] = (s[i] >= min && s[i] <= max) ? g[i] : 0.0f;
+        }
+    } else {
+        GGML_ABORT("unsupported type for CLAMP_BACK: %d", (int) dst->type);
+    }
+
+    GGML_UNUSED(params);
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -1841,6 +2040,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            {
+                ggml_compute_forward_mul_mat_id_back(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_ID_BACK_SRC1:
+            {
+                ggml_compute_forward_mul_mat_id_back_src1(params, tensor);
+            } break;
+        case GGML_OP_CLAMP_BACK:
+            {
+                ggml_compute_forward_clamp_back(params, tensor);
             } break;
         case GGML_OP_SCALE:
             {
@@ -2304,6 +2515,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
+        case GGML_OP_MUL_MAT_ID_BACK:
+        case GGML_OP_CLAMP_BACK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2839,6 +3052,18 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                    } break;
+                case GGML_OP_MUL_MAT_ID_BACK:
+                    {
+                        cur = 0;
+                        const struct ggml_tensor * ids = node->src[2];
+                        const struct ggml_tensor * as  = node->src[3];
+                        const int n_as = as->ne[2];
+
+                        // matrix_row_counts
+                        cur += n_as * sizeof(int64_t) + sizeof(int64_t);
+                        // matrix_rows
+                        cur += n_as * ids->ne[0] * ids->ne[1] * sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

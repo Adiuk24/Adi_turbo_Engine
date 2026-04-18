@@ -432,6 +432,125 @@ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * p
     return nullptr;
 }
 
+llama_adapter_lora * llama_adapter_lora_init_new(llama_model * model, int rank) {
+    llama_adapter_lora * adapter = new llama_adapter_lora(model);
+    adapter->alpha = (float)rank;
+
+    // allocate a single context/buffer for all lora parameters dynamically
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * 1024 * 1024, // 4 MB for tensor metadata
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        LLAMA_LOG_ERROR("%s: failed to allocate context for LoRA adapter\n", __func__);
+        delete adapter;
+        return nullptr;
+    }
+    adapter->ctxs.emplace_back(ctx);
+
+    // Collect all trainable tensors and construct lora pairs
+    std::vector<std::string> target_tensor_names;
+    if (model->hparams.n_expert > 0) {
+        // If MoE, only target attention tensors
+        target_tensor_names = {
+            ".attn_q.weight",
+            ".attn_k.weight",
+            ".attn_v.weight",
+            ".attn_out.weight",
+        };
+    } else {
+        // For non-MoE models, target all linear layers
+        target_tensor_names = {
+            ".attn_q.weight",
+            ".attn_k.weight",
+            ".attn_v.weight",
+            ".attn_out.weight",
+            ".ffn_gate.weight",
+            ".ffn_down.weight",
+            ".ffn_up.weight",
+        };
+    }
+
+    for (auto & it : llama_internal_get_tensor_map(model)) {
+        const std::string & name = it.first;
+        ggml_tensor * model_tensor = it.second;
+        if (!model_tensor) continue;
+
+        // Check if the current tensor is in our target list
+        bool is_target = false;
+        for (const auto& target_name : target_tensor_names) {
+            if (name.find(target_name) != std::string::npos) {
+                is_target = true;
+                break;
+            }
+        }
+
+        if (is_target) {
+            std::string base_name = name; // KEEP .weight!
+            
+            // a: [in_features, rank]
+            ggml_tensor * lora_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, model_tensor->ne[0], rank);
+            ggml_set_name(lora_a, (base_name + ".lora_a").c_str());
+
+            // b: [rank, out_features]
+            ggml_tensor * lora_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, model_tensor->ne[1]);
+            ggml_set_name(lora_b, (base_name + ".lora_b").c_str());
+
+            adapter->ab_map[base_name] = llama_adapter_lora_weight(lora_a, lora_b);
+        }
+    }
+
+    // Allocate buffer
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); // Training memory defaults
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+    if (!buf) {
+        delete adapter;
+        return nullptr;
+    }
+    adapter->bufs.emplace_back(buf);
+
+    // Initialize with 0 for B, tiny normal random for A
+    // (Here we just zero them. Proper QAT init is needed later)
+    ggml_backend_buffer_clear(buf, 0);
+
+    model->loras.insert(adapter);
+    return adapter;
+}
+
+bool llama_adapter_lora_save(struct llama_adapter_lora * adapter, const char * path) {
+    if (!adapter || !path) return false;
+
+    struct gguf_context * ctx = gguf_init_empty();
+    if (!ctx) return false;
+
+    // Add metadata
+    gguf_set_val_f32(ctx, "adapter.lora.alpha", adapter->alpha);
+    // Determine rank from the first available tensor
+    if (!adapter->ab_map.empty()) {
+        int rank = (int)adapter->ab_map.begin()->second.a->ne[1];
+        gguf_set_val_i32(ctx, "adapter.lora.rank", rank);
+    }
+
+    // Add other metadata from gguf_kv
+    for (auto const& [key, val] : adapter->gguf_kv) {
+        gguf_set_val_str(ctx, key.c_str(), val.c_str());
+    }
+
+    // Add tensors
+    for (auto const& [name, weights] : adapter->ab_map) {
+        gguf_add_tensor(ctx, weights.a);
+        gguf_add_tensor(ctx, weights.b);
+    }
+
+    // Write to file
+    bool success = gguf_write_to_file(ctx, path, false);
+    gguf_free(ctx);
+
+    return success;
+}
+
 int32_t llama_adapter_meta_val_str(const llama_adapter_lora * adapter, const char * key, char * buf, size_t buf_size) {
     const auto & it = adapter->gguf_kv.find(key);
     if (it == adapter->gguf_kv.end()) {

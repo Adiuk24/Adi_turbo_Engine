@@ -2553,6 +2553,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(common_arg(
+        {"--teacher"}, "FNAME",
+        "teacher model GGUF for knowledge distillation",
+        [](common_params & params, const std::string & value) {
+            params.teacher.path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--distill-temp"}, "N",
+        "temperature for knowledge distillation (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            params.qat.distill_temp = std::stof(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--lora-rank"}, "N",
+        "rank (r) for the LoRA adapter (default: 8)",
+        [](common_params & params, int value) {
+            params.qat.lora_rank = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--lora-alpha"}, "N",
+        "alpha value for LoRA scaling (default: 16)",
+        [](common_params & params, int value) {
+            // we don't have alpha in struct yet, but can add it or just use rank
+            params.qat.lora_rank = value; 
+        }
+    ));
+    add_opt(common_arg(
         {"--control-vector"}, "FNAME",
         "add a control vector\nnote: use comma-separated values to add multiple control vectors",
         [](common_params & params, const std::string & value) {
@@ -3737,6 +3766,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid --optimizer, valid options: adamw, sgd");
             }
         }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--teacher"}, "FNAME",
+        "Teacher model path for knowledge distillation",
+        [](common_params & params, const std::string & value) { params.teacher.path = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--lora-train"},
+        "Enable LoRA finetuning on the base model directly",
+        [](common_params & params) { params.qat.lora_train = true; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--lora-rank"}, "N",
+        string_format("LoRA rank for training (default: %d)", params.qat.lora_rank),
+        [](common_params & params, int value) { params.qat.lora_rank = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--lora-out"}, "FNAME",
+        "Path to save LoRA adapter",
+        [](common_params & params, const std::string & value) { params.qat.lora_out = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--distill"},
+        "Enable KL divergence distillation from teacher model",
+        [](common_params & params) { params.qat.distill = true; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--steps"}, "N",
+        string_format("Total steps for distillation/finetuning (default: %d)", params.qat.steps),
+        [](common_params & params, int value) { params.qat.steps = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--data"}, "FNAME",
+        "Training data file",
+        [](common_params & params, const std::string & value) { params.qat.data_path = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
     add_opt(common_arg(
         {"--check"},

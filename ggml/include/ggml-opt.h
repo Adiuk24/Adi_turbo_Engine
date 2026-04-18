@@ -32,6 +32,7 @@ extern "C" {
         GGML_OPT_LOSS_TYPE_SUM,
         GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
         GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR,
+        GGML_OPT_LOSS_TYPE_KLD,
     };
 
     // ====== Dataset ======
@@ -127,6 +128,8 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        float distill_temp; // temperature for KLD distillation
     };
 
     // get parameters for an optimization context with defaults set where possible

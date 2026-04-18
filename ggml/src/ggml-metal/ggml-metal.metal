@@ -11363,3 +11363,137 @@ kernel void kernel_count_equal(
 typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
+
+kernel void kernel_mul_mat_id_back(
+        constant ggml_metal_kargs_mul_mat_id_back & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3  ntg[[threads_per_threadgroup]]) {
+    const int i_model  = tgpig.x * ntg.x + tpitg.x;
+    const int i_ff     = tgpig.y * ntg.y + tpitg.y;
+    const int i_expert = tgpig.z;
+
+    if (i_model >= args.ne0 || i_ff >= args.ne1 || i_expert >= args.ne2) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int t = 0; t < args.ne11; ++t) {
+        for (int k = 0; k < args.ne20; ++k) {
+            const int expert_id = *(device const int32_t *)(src2 + t*args.nb21 + k*sizeof(int32_t));
+            if (expert_id == i_expert) {
+                const float g = *(device const float *)(src0 + t*args.nb02 + k*args.nb01 + i_ff*sizeof(float));
+                const float i = *(device const float *)(src1 + t*args.nb11 + i_model*sizeof(float));
+                sum += g * i;
+            }
+        }
+    }
+
+    *(device float *)(dst + i_expert*args.nb3 + i_ff*args.nb2 + i_model*args.nb1) = sum;
+}
+
+template<typename T, typename TC>
+kernel void kernel_clamp_back(
+    constant ggml_metal_kargs_clamp_back & args,
+    device const char * src0,
+    device const char * src1,
+    device       char * dst,
+    uint tpig[[thread_position_in_grid]]) {
+    const uint i = tpig;
+    if (i >= args.n) return;
+
+    device const T * grad = (device const T *) src0;
+    device const T * x    = (device const T *) src1;
+    device       T * d    = (device       T *) dst;
+
+    const TC xi = (TC) x[i];
+    const TC gi = (TC) grad[i];
+
+    d[i] = (T) (TC(xi >= args.min) * TC(xi <= args.max) * gi);
+}
+
+typedef decltype(kernel_clamp_back<float, float>) kernel_clamp_back_t;
+
+template [[host_name("kernel_clamp_back_f32")]] kernel kernel_clamp_back_t kernel_clamp_back<float, float>;
+
+
+template<typename T, int q_bs, void (*dequant)(device const T *, short, thread float4x4 &)>
+kernel void kernel_mul_mat_id_back_src1(
+    constant ggml_metal_kargs_mul_mat_id_back_src1 & args [[buffer(0)]],
+    device const char * src0 [[buffer(1)]],
+    device const char * src1 [[buffer(2)]],
+    device const char * src2 [[buffer(3)]],
+    device       char * dst  [[buffer(4)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    ushort tiitg[[thread_index_in_threadgroup]]) {
+
+    const int i_k0 = tgpig.x * 32;
+    const int i_st = tgpig.y;
+
+    const int s = i_st % args.ne11;
+    const int t = i_st / args.ne11;
+
+    if (i_k0 >= args.ne00 || s >= args.ne11 || t >= args.ne12) {
+        return;
+    }
+
+    const int32_t e = *(device const int32_t *)(src2 + t*args.nb22 + s*args.nb21);
+
+    if (e < 0 || e >= args.ne02) {
+        for (int i = 0; i < 32; ++i) {
+            if (i_k0 + i < args.ne00) {
+                *(device float *)(dst + t*args.nbd2 + s*args.nbd1 + (i_k0 + i)*sizeof(float)) = 0.0f;
+            }
+        }
+        return;
+    }
+
+    float sums[32] = {0.0f};
+
+    for (int n = 0; n < args.ne01; ++n) {
+        const float g = *(device const float *)(src1 + t*args.nb12 + s*args.nb11 + (uint64_t)n*sizeof(float));
+        if (g == 0.0f) continue;
+
+        device const T * xb = (device const T *)(src0 + (uint64_t)e*args.nb02 + (uint64_t)n*args.nb01 + (uint64_t)(i_k0/q_bs)*sizeof(T));
+        
+        const int il0 = (i_k0 % q_bs) / 16;
+        
+        float4x4 reg0, reg1;
+        dequant(xb, il0,   reg0);
+        dequant(xb, il0+1, reg1);
+
+        for (int i = 0; i < 16; ++i) {
+            sums[i]    += ((thread float *)&reg0)[i] * g;
+            sums[i+16] += ((thread float *)&reg1)[i] * g;
+        }
+    }
+
+    for (int i = 0; i < 32; ++i) {
+        if (i_k0 + i < args.ne00) {
+            *(device float *)(dst + t*args.nbd2 + s*args.nbd1 + (i_k0 + i)*sizeof(float)) = sums[i];
+        }
+    }
+}
+
+static void dequant_f32_id(device const float4x4 * xb, short il, thread float4x4 & reg) { reg = xb[il]; }
+
+static void dequant_f16_id(device const half4x4 * xb, short il, thread float4x4 & reg) {
+    device const half4x4 & val = xb[il];
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            reg[i][j] = (float)val[i][j];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mat_id_back_src1<float4x4, 16, dequant_f32_id>) mul_mat_id_back_src1_t;
+
+template [[host_name("kernel_mul_mat_id_back_src1_f32")]]   kernel mul_mat_id_back_src1_t kernel_mul_mat_id_back_src1<float4x4,    16,  dequant_f32_id>;
+template [[host_name("kernel_mul_mat_id_back_src1_f16")]]   kernel mul_mat_id_back_src1_t kernel_mul_mat_id_back_src1<half4x4,     16,  dequant_f16_id>;
+template [[host_name("kernel_mul_mat_id_back_src1_iq3_s")]] kernel mul_mat_id_back_src1_t kernel_mul_mat_id_back_src1<block_iq3_s, 256, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mat_id_back_src1_iq4_nl")]] kernel mul_mat_id_back_src1_t kernel_mul_mat_id_back_src1<block_iq4_nl, 32, dequantize_iq4_nl>;
+template [[host_name("kernel_mul_mat_id_back_src1_q5_0")]]  kernel mul_mat_id_back_src1_t kernel_mul_mat_id_back_src1<block_q5_0,  32, dequantize_q5_0>;

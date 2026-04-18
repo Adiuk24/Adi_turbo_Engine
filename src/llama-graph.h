@@ -97,6 +97,9 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+    virtual void get_tensors(std::vector<ggml_tensor *> & out) {
+        GGML_UNUSED(out);
+    }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -112,6 +115,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (tokens) out.push_back(tokens);
+        if (embd)   out.push_back(embd);
+    }
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
@@ -127,6 +134,9 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (pos) out.push_back(pos);
+    }
 
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
@@ -141,6 +151,9 @@ public:
     virtual ~llm_graph_input_attn_temp() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (attn_scale) out.push_back(attn_scale);
+    }
 
     ggml_tensor * attn_scale = nullptr; // F32 [n_batch]
 
@@ -155,6 +168,9 @@ public:
     virtual ~llm_graph_input_pos_bucket() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (pos_bucket) out.push_back(pos_bucket);
+    }
 
     ggml_tensor * pos_bucket = nullptr; // I32 [n_batch, n_batch]
 
@@ -169,6 +185,9 @@ public:
     virtual ~llm_graph_input_pos_bucket_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (pos_bucket) out.push_back(pos_bucket);
+    }
 
     ggml_tensor * pos_bucket = nullptr; // I32 [n_kv, n_batch]
 
@@ -186,10 +205,12 @@ public:
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
-
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (out_ids) out.push_back(out_ids);
+    }
 
-    ggml_tensor * out_ids; // I32 [n_outputs]
+    ggml_tensor * out_ids = nullptr; // I32 [n_outputs]
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -203,6 +224,9 @@ public:
     virtual ~llm_graph_input_mean() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (mean) out.push_back(mean);
+    }
 
     ggml_tensor * mean; // F32 [n_batch, n_batch]
 
@@ -215,6 +239,9 @@ public:
     virtual ~llm_graph_input_cls() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (cls) out.push_back(cls);
+    }
 
     ggml_tensor * cls; // I32 [n_batch]
 
@@ -228,8 +255,12 @@ public:
     virtual ~llm_graph_input_rs() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
-
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (s_copy)        out.push_back(s_copy);
+        if (s_copy_main)   out.push_back(s_copy_main);
+        if (s_copy_extra)  out.push_back(s_copy_extra);
+    }
 
     ggml_tensor * s_copy;  // I32 [n_rs]
 
@@ -252,6 +283,9 @@ public:
     virtual ~llm_graph_input_cross_embd() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (cross_embd) out.push_back(cross_embd);
+    }
 
     ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
 
@@ -267,6 +301,12 @@ public:
     ~llm_graph_input_attn_no_cache() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (self_kq_mask) out.push_back(self_kq_mask);
+        if (self_kq_mask_cnv) out.push_back(self_kq_mask_cnv);
+        if (self_kq_mask_swa) out.push_back(self_kq_mask_swa);
+        if (self_kq_mask_swa_cnv) out.push_back(self_kq_mask_swa_cnv);
+    }
 
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
@@ -296,6 +336,12 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (self_k_idxs) out.push_back(self_k_idxs);
+        if (self_v_idxs) out.push_back(self_v_idxs);
+        if (self_kq_mask) out.push_back(self_kq_mask);
+        if (self_kq_mask_cnv) out.push_back(self_kq_mask_cnv);
+    }
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
@@ -338,6 +384,11 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (self_k_idxs) out.push_back(self_k_idxs);
+        if (self_kq_mask) out.push_back(self_kq_mask);
+        if (self_kq_mask_cnv) out.push_back(self_kq_mask_cnv);
+    }
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
@@ -369,6 +420,16 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (self_k_idxs) out.push_back(self_k_idxs);
+        if (self_v_idxs) out.push_back(self_v_idxs);
+        if (self_k_idxs_swa) out.push_back(self_k_idxs_swa);
+        if (self_v_idxs_swa) out.push_back(self_v_idxs_swa);
+        if (self_kq_mask) out.push_back(self_kq_mask);
+        if (self_kq_mask_cnv) out.push_back(self_kq_mask_cnv);
+        if (self_kq_mask_swa) out.push_back(self_kq_mask_swa);
+        if (self_kq_mask_swa_cnv) out.push_back(self_kq_mask_swa_cnv);
+    }
 
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_v_idxs()     const { return self_v_idxs; }
@@ -404,6 +465,10 @@ public:
     ~llm_graph_input_attn_cross() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (cross_kq_mask) out.push_back(cross_kq_mask);
+        if (cross_kq_mask_cnv) out.push_back(cross_kq_mask_cnv);
+    }
 
     ggml_tensor * get_kq_mask_cross() const { return cross_kq_mask_cnv; }
 
@@ -429,6 +494,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (inp_attn) inp_attn->get_tensors(out);
+        if (inp_rs)   inp_rs->get_tensors(out);
+    }
 
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
@@ -457,6 +526,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (inp_attn) inp_attn->get_tensors(out);
+        if (inp_rs)   inp_rs->get_tensors(out);
+    }
 
     std::unique_ptr<llm_graph_input_attn_k> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
@@ -485,6 +558,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        if (inp_attn) inp_attn->get_tensors(out);
+        if (inp_rs)   inp_rs->get_tensors(out);
+    }
 
     std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn;
     std::unique_ptr<llm_graph_input_rs>          inp_rs;
@@ -504,6 +581,9 @@ public:
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void get_tensors(std::vector<ggml_tensor *> & out) override {
+        GGML_UNUSED(out);
+    }
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -647,7 +727,7 @@ public:
 
     int64_t get_max_nodes() const;
 
-    void reset();
+    void reset(bool grads = false, bool no_alloc = true);
 
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs();

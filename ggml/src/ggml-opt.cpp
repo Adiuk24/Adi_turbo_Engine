@@ -69,6 +69,8 @@ struct ggml_opt_context {
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+
+    float distill_temp = 1.0f;
 };
 
 struct ggml_opt_result {
@@ -256,6 +258,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*distill_temp    =*/ 1.0f,
     };
 }
 
@@ -353,8 +356,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         //   - ncorrect (if using static graphs, 2 tensors).
         constexpr size_t n_loss = 1;
         const size_t tensors_per_param = (accumulate ? 1 : 0) + (need_momenta ? 2 : 0);
-        const size_t tensors_const = opt_ctx->static_graphs ? 9 : 0;
-        const size_t size_meta = (n_loss + tensors_per_param*n_param + tensors_const) * ggml_tensor_overhead();
+        const size_t tensors_const = (opt_ctx->static_graphs ? 9 : 0) + 256; // Increased padding
+        const size_t size_meta = (n_loss + tensors_per_param*n_param + tensors_const) * ggml_tensor_overhead() + 2*1024*1024; // 2MB padding
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
             /*.mem_buffer =*/ nullptr,
@@ -399,15 +402,29 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = false;
             break;
         }
+        case GGML_OPT_LOSS_TYPE_KLD:
         case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: {
             opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
-            ggml_set_name(opt_ctx->labels, "labels");
-            opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
-            ggml_set_name(opt_ctx->loss, "loss_cross_entropy");
-            if (opt_ctx->opt_period > 1) {
-                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
-                ggml_set_name(opt_ctx->loss, "loss_cross_entropy_scaled");
+            ggml_set_name(opt_ctx->labels, opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_KLD ? "teacher_probs" : "labels");
+            
+            struct ggml_tensor * outputs = ggml_cont(ctx_results, opt_ctx->outputs);
+            if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_KLD && opt_ctx->distill_temp != 1.0f) {
+                outputs = ggml_scale(ctx_results, outputs, 1.0f / opt_ctx->distill_temp);
+                ggml_set_name(outputs, "scaled_outputs");
+            }
+            
+            opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, outputs, opt_ctx->labels);
+            ggml_set_name(opt_ctx->loss, opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_KLD ? "loss_kld" : "loss_cross_entropy");
+            
+            float scale = 1.0f / opt_ctx->opt_period;
+            if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_KLD) {
+                scale *= (opt_ctx->distill_temp * opt_ctx->distill_temp);
+            }
+            
+            if (scale != 1.0f) {
+                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, scale);
+                ggml_set_name(opt_ctx->loss, opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_KLD ? "loss_kld_scaled" : "loss_cross_entropy_scaled");
             }
             opt_ctx->loss_per_datapoint = true;
             break;
@@ -433,7 +450,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_loss(opt_ctx->loss);
     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_KLD) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
@@ -559,6 +576,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->distill_temp     = params.distill_temp;
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -716,9 +734,10 @@ void ggml_opt_prepare_alloc(
         struct ggml_tensor  * outputs) {
     GGML_ASSERT(!opt_ctx->static_graphs);
     opt_ctx->ctx_compute = ctx_compute;
-    opt_ctx->gf          = gf;
-    opt_ctx->inputs      = inputs;
-    opt_ctx->outputs     = outputs;
+    
+    opt_ctx->gf      = gf;
+    opt_ctx->inputs  = inputs;
+    opt_ctx->outputs = outputs;
 }
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {

@@ -650,6 +650,11 @@ extern "C" {
             struct llama_model * model,
             const char * path_lora);
 
+    // Create a new empty LoRA adapter for training
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_new(
+            struct llama_model * model,
+            int32_t rank);
+
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure
     // - The output string is always null-terminated and cleared on failure
@@ -671,6 +676,9 @@ extern "C" {
     // Manually free a LoRA adapter
     // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
+
+    // Save LoRA adapter to file
+    LLAMA_API bool llama_adapter_lora_save(struct llama_adapter_lora * adapter, const char * path);
 
     // Get the invocation tokens if the current lora is an alora
     LLAMA_API uint64_t            llama_adapter_get_alora_n_invocation_tokens(const struct llama_adapter_lora * adapter);
@@ -1551,6 +1559,9 @@ extern "C" {
     // always returns true
     LLAMA_API bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userdata);
 
+    // returns true for LoRA parameters
+    LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
+
     struct llama_opt_params {
         uint32_t n_ctx_train; // assumed context size post training, use context size specified in llama_context if 0
 
@@ -1561,6 +1572,10 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // Soft-distillation from teacher model
+        struct llama_context * ctx_teacher;
+        float distill_temperature;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

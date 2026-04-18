@@ -1189,7 +1189,7 @@ int64_t llm_graph_result::get_max_nodes() const {
     return max_nodes;
 }
 
-void llm_graph_result::reset() {
+void llm_graph_result::reset(bool grads, bool no_alloc) {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
@@ -1204,7 +1204,8 @@ void llm_graph_result::reset() {
 
     inputs.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    const size_t meta_size = 1024ULL * 1024ULL * 1024ULL; // 1GB metadata pool
+    buf_compute_meta.resize(meta_size);
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
@@ -1214,7 +1215,7 @@ void llm_graph_result::reset() {
 
     ctx_compute.reset(ggml_init(params));
 
-    gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+    gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, grads);
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {

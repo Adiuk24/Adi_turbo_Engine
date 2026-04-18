@@ -199,7 +199,8 @@ struct llama_context {
             bool                             train,
             int64_t                          idata_in_loop,
             int64_t                          ndata_in_loop,
-            int64_t                          t_loop_start);
+            int64_t                          t_loop_start,
+            ggml_backend_buffer_t            buf_inputs = nullptr);
 
 private:
     //
@@ -318,6 +319,9 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+
+    llama_context * ctx_teacher = nullptr;
+    float distill_temp = 1.0f;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

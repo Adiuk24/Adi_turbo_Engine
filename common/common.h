@@ -567,6 +567,18 @@ struct common_params {
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     float val_split = 0.05f; // fraction of the data used for the validation set
 
+    // QAT Distillation
+    struct common_params_model teacher;
+    struct {
+        bool lora_train           = false;
+        int32_t lora_rank         = 64;
+        bool distill              = false;
+        float distill_temp        = 2.0f;
+        std::string lora_out      = "lora-distilled.gguf";
+        std::string data_path     = "";
+        int32_t steps             = 5000;
+    } qat;
+
     // embedding
     bool embedding         = false; // get only sentence embedding
     int32_t embd_normalize = 2;     // normalisation for embeddings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)
