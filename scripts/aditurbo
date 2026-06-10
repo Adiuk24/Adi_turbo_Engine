@@ -4,6 +4,7 @@ set -euo pipefail
 # AdiTurbo CLI
 # Product: AdiTurbo
 # Stack: Weights + KV + Runtime
+ADITURBO_VERSION="0.2.0"
 
 SOURCE_PATH="${BASH_SOURCE[0]}"
 while [[ -h "${SOURCE_PATH}" ]]; do
@@ -367,7 +368,12 @@ run_ui() {
         warn "API readiness timed out; continuing"
     fi
 
-    "${PYTHON_BIN}" - "${ui_root}" "${ui_host}" "${ui_port}" "${ROOT_DIR}/scripts/aditurbo" >"${web_log}" 2>&1 <<'PY' &
+    # Per-session token: POST endpoints require it, blocking CSRF from other
+    # origins (a malicious page can hit 127.0.0.1 but cannot read the token).
+    local ui_token=""
+    ui_token="$(openssl rand -hex 16 2>/dev/null || od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+
+    "${PYTHON_BIN}" - "${ui_root}" "${ui_host}" "${ui_port}" "${ROOT_DIR}/scripts/aditurbo" "${ui_token}" >"${web_log}" 2>&1 <<'PY' &
 import http.server
 import json
 import os
@@ -379,6 +385,7 @@ UI_ROOT = sys.argv[1]
 HOST = sys.argv[2]
 PORT = int(sys.argv[3])
 ADITURBO = sys.argv[4]
+TOKEN = sys.argv[5]
 
 ALLOWED_SOURCE_MODE = {"f16", "hf-dir", "hf-repo"}
 ALLOWED_TYPES = {"TQ1_0", "TQ2_0", "TQ3_0", "TQ4_0"}
@@ -401,7 +408,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def _authorized(self):
+        # Reject cross-origin requests: browsers always send Origin on
+        # cross-site POST; same-page fetches send our own origin or nothing.
+        origin = self.headers.get("Origin", "")
+        if origin:
+            allowed = {f"http://{HOST}:{PORT}", f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
+            if origin not in allowed:
+                return False
+        # Require the per-session token (delivered via the launch URL).
+        return self.headers.get("X-AdiTurbo-Token", "") == TOKEN
+
     def do_POST(self):
+        if not self._authorized():
+            self._json(403, {"ok": False, "error": "forbidden"})
+            return
         if self.path != "/api/convert":
             self._json(404, {"ok": False, "error": "not_found"})
             return
@@ -484,7 +505,7 @@ PY
         warn "UI web server did not become ready on ${ui_host}:${ui_port}"
     fi
 
-    local ui_url="http://${ui_host}:${ui_port}/aditurbo-ui.html?api=http://${host}:${api_port}&model=$(basename "${model}")"
+    local ui_url="http://${ui_host}:${ui_port}/aditurbo-ui.html?api=http://${host}:${api_port}&model=$(basename "${model}")&token=${ui_token}"
     log "API: http://${host}:${api_port}"
     log "UI:  ${ui_url}"
     log "Press Ctrl+C to stop."
@@ -542,7 +563,7 @@ run_install() {
         log "configuring build dir: ${BUILD_DIR}"
         cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${build_type}"
         log "building required binaries"
-        cmake --build "${BUILD_DIR}" --target llama-cli llama-quantize llama-bench llama-perplexity llama-imatrix --parallel "${parallel}"
+        cmake --build "${BUILD_DIR}" --target llama-cli llama-server llama-quantize llama-bench llama-perplexity llama-imatrix --parallel "${parallel}"
     fi
 
     if [[ "$do_link" -eq 1 ]]; then
@@ -778,11 +799,24 @@ run_convert() {
     local qt_upper
     qt_upper="$(printf '%s' "${quant_type}" | tr '[:lower:]' '[:upper:]')"
 
+    # Classify the requested weight quant type. llama-quantize accepts BOTH names
+    # (TQ3_0) and numeric llama_ftype ids (40), so match both. TQ3_S is excluded:
+    # it is a KV-cache-only format, never a weight quant, and ignores imatrix.
+    #   36=TQ1_0  37=TQ2_0  40=TQ3_0  41=TQ4_0
+    local is_tq_weight=0 is_ternary=0
+    case "${qt_upper}" in
+        TQ1_0|TQ2_0|TQ3_0|TQ4_0) is_tq_weight=1 ;;
+        36|37|40|41)             is_tq_weight=1 ;;
+    esac
+    case "${qt_upper}" in
+        TQ1_0|TQ2_0|36|37)       is_ternary=1 ;;
+    esac
+
     # Ternary formats encode only {-1,0,+1} per weight. They are near-lossless for
     # QAT/BitNet-style models trained with ternary weights, but post-training
     # quantization of a normal model is unusable even WITH an imatrix
     # (measured: TQ2_0+imatrix PPL ~1400 vs Q2_K+imatrix ~12 on the same model).
-    if [[ "${qt_upper}" == "TQ1_0" || "${qt_upper}" == "TQ2_0" ]]; then
+    if [[ "${is_ternary}" -eq 1 ]]; then
         warn "${quant_type} is a ternary format: only suitable for QAT/BitNet-trained models."
         warn "Post-training quantization of a standard model WILL produce garbage (use TQ3_0/TQ4_0 instead)."
     fi
@@ -792,13 +826,13 @@ run_convert() {
         log "quantizing with imatrix (${quant_type})"
         "${BIN_DIR}/llama-quantize" --imatrix "${imatrix}" --token-embedding-type "${embed_type}" "${f16_model}" "${out_model}" "${quant_type}"
     else
-        # TQ (TurboQuant) formats are low-bit and depend on an importance matrix to
-        # pick per-block scales. Without one the FFN weights collapse to ~zero and the
-        # model produces garbage (measured PPL ~3300+ vs ~9 with imatrix). Refuse
-        # rather than silently ship a broken model. Pass --calibration <text> to
-        # generate one automatically, --imatrix <file> to supply one, or --force to
-        # override (only sensible for high-bit non-TQ types).
-        if [[ "${qt_upper}" == TQ* && "${force}" != "1" && "${force}" != "true" ]]; then
+        # TQ (TurboQuant) weight formats are low-bit and depend on an importance
+        # matrix to pick per-block scales. Without one the FFN weights collapse to
+        # ~zero and the model produces garbage (measured PPL ~3300+ vs ~9 with
+        # imatrix). Refuse rather than silently ship a broken model. Pass
+        # --calibration <text> to generate one, --imatrix <file> to supply one, or
+        # --force to override (only sensible for high-bit non-TQ types).
+        if [[ "${is_tq_weight}" -eq 1 && "${force}" != "1" && "${force}" != "true" ]]; then
             die "refusing to quantize ${quant_type} without an imatrix — it produces a broken model. Provide --calibration <text-file> (auto-generates one) or --imatrix <file>. Use --force to override."
         fi
         warn "quantizing without imatrix (${quant_type})"
@@ -1072,7 +1106,7 @@ PY
 run_package() {
     local output_dir="${ROOT_DIR}/dist"
     local name
-    name="aditurbo-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+    name="aditurbo-${ADITURBO_VERSION}-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
     local build_type="Release"
     local parallel
     parallel="$(detect_parallelism)"
@@ -1094,10 +1128,11 @@ run_package() {
     if [[ "${do_build}" -eq 1 ]]; then
         require_cmd cmake
         cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${build_type}"
-        cmake --build "${BUILD_DIR}" --target llama-cli llama-quantize llama-bench llama-perplexity llama-imatrix --parallel "${parallel}"
+        cmake --build "${BUILD_DIR}" --target llama-cli llama-server llama-quantize llama-bench llama-perplexity llama-imatrix --parallel "${parallel}"
     fi
 
     require_bin "${BIN_DIR}/llama-cli"
+    require_bin "${BIN_DIR}/llama-server"
     require_bin "${BIN_DIR}/llama-quantize"
     require_bin "${BIN_DIR}/llama-bench"
     require_bin "${BIN_DIR}/llama-perplexity"
@@ -1119,10 +1154,13 @@ run_package() {
     chmod +x "${stage}/${name}/bin/adi-ccp"
     cp "${ROOT_DIR}/scripts/aditurbo-ui.html" "${stage}/${name}/scripts/"
     cp "${BIN_DIR}/llama-cli" "${stage}/${name}/bin/"
+    cp "${BIN_DIR}/llama-server" "${stage}/${name}/bin/"
     cp "${BIN_DIR}/llama-quantize" "${stage}/${name}/bin/"
     cp "${BIN_DIR}/llama-bench" "${stage}/${name}/bin/"
     cp "${BIN_DIR}/llama-perplexity" "${stage}/${name}/bin/"
     cp "${BIN_DIR}/llama-imatrix" "${stage}/${name}/bin/"
+    # bundle the upstream MIT license — required for redistribution
+    cp "${ROOT_DIR}/LICENSE" "${stage}/${name}/LICENSE"
     cp "${ROOT_DIR}/convert_hf_to_gguf.py" "${stage}/${name}/"
     cp "${ROOT_DIR}/convert_hf_to_gguf.py" "${stage}/${name}/scripts/"
     cp -R "${ROOT_DIR}/gguf-py/gguf" "${stage}/${name}/gguf-py/"
@@ -1136,7 +1174,9 @@ Install:
   3) Run: aditurbo help  (or adi-ccp help)
 
 Included binaries:
-  llama-cli, llama-quantize, llama-bench, llama-perplexity, llama-imatrix
+  llama-cli, llama-server, llama-quantize, llama-bench, llama-perplexity, llama-imatrix
+
+License: MIT (see LICENSE — based on llama.cpp, github.com/ggerganov/llama.cpp)
 
 Runtime default:
   aditurbo run --model <model.gguf>
@@ -1166,6 +1206,11 @@ main() {
         test) run_test "$@" ;;
         package) run_package "$@" ;;
         help|-h|--help) print_main_help ;;
+        version|-v|--version)
+            local git_rev=""
+            git_rev="$(git -C "${ROOT_DIR}" rev-parse --short HEAD 2>/dev/null || true)"
+            printf 'aditurbo %s%s\n' "${ADITURBO_VERSION}" "${git_rev:+ (${git_rev})}"
+            ;;
         *) die "unknown command: ${cmd} (run: aditurbo help)" ;;
     esac
 }
