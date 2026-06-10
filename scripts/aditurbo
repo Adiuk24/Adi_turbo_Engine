@@ -373,6 +373,13 @@ run_ui() {
     local ui_token=""
     ui_token="$(openssl rand -hex 16 2>/dev/null || od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 
+    # The session token is carried in the launch URL; for a local bind it never
+    # leaves the machine, but on a non-local bind it can land in proxy/access
+    # logs or browser history. Warn so the user can prefer an SSH tunnel.
+    if [[ "${ui_host}" != "127.0.0.1" && "${ui_host}" != "localhost" ]]; then
+        warn "binding UI to non-local host ${ui_host}: the session token travels in the URL and may be logged. Prefer 127.0.0.1 + an SSH tunnel for remote access."
+    fi
+
     "${PYTHON_BIN}" - "${ui_root}" "${ui_host}" "${ui_port}" "${ROOT_DIR}/scripts/aditurbo" "${ui_token}" >"${web_log}" 2>&1 <<'PY' &
 import http.server
 import json
@@ -412,7 +419,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Reject cross-origin requests: browsers always send Origin on
         # cross-site POST; same-page fetches send our own origin or nothing.
         origin = self.headers.get("Origin", "")
-        if origin:
+        # When bound to a wildcard address the set of valid origins (the machine's
+        # real IPs) can't be enumerated, and the browser sends the accessed IP as
+        # Origin — so skip the allowlist there and rely on the unguessable token
+        # (the actual CSRF defense). For a fixed host, exact-match the allowlist.
+        if origin and HOST not in ("0.0.0.0", "::"):
             allowed = {f"http://{HOST}:{PORT}", f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
             if origin not in allowed:
                 return False
