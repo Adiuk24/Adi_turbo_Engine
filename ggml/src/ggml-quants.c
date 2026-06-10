@@ -2316,11 +2316,127 @@ void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RE
 }
 
 size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
-    // TODO: TQ1_0 uses base-3 encoding which makes imatrix-weighted scale search
-    // significantly more complex.  Leaving unweighted for now.
-    (void)imatrix;
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb = n_per_row / QK_K;
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
-    quantize_row_tq1_0_ref(src, dst, nrows*n_per_row);
+
+    block_tq1_0 * y = (block_tq1_0 *) dst;
+    const float * x = src;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float * row_imatrix = imatrix;
+        for (int64_t i = 0; i < nb; ++i) {
+            const float * xb = x + i * QK_K;
+            const float * wb = row_imatrix ? row_imatrix + i * QK_K : NULL;
+
+            // ITF (Iterative Ternary Fitting) — same optimizer as TQ2_0. Replaces the
+            // old d=amax scale, which rounded the entire bulk of FFN weights to zero
+            // (the same failure class fixed in TQ3_0/TQ4_0). Operates on the ternary
+            // assignments T[]; the base-3 packing below is unchanged from the ref.
+            float sum_abs = 0.0f;
+            for (int j = 0; j < QK_K; j++) {
+                sum_abs += fabsf(xb[j]);
+            }
+            float d = 0.75f * sum_abs / (float)QK_K;
+            if (d == 0.0f) {
+                d = 1.0f;
+            }
+
+            int8_t T[QK_K]; // ternary assignments: -1, 0, +1
+            float id = 1.0f / d;
+            for (int j = 0; j < QK_K; j++) {
+                int t = lroundf(xb[j] * id);
+                T[j] = (int8_t)(t < -1 ? -1 : (t > 1 ? 1 : t));
+            }
+            for (int iter = 0; iter < 10; iter++) {
+                float num = 0.0f;
+                float den = 0.0f;
+                if (wb) {
+                    for (int j = 0; j < QK_K; j++) {
+                        const float wt = wb[j];
+                        num += wt * xb[j] * (float)T[j];
+                        den += wt * (float)(T[j] * T[j]);
+                    }
+                } else {
+                    for (int j = 0; j < QK_K; j++) {
+                        num += xb[j] * (float)T[j];
+                        den += (float)(T[j] * T[j]);
+                    }
+                }
+                if (den > 0.0f) {
+                    d = num / den;
+                }
+                if (d < 0.0f) {
+                    d = -d;
+                    for (int j = 0; j < QK_K; j++) {
+                        T[j] = -T[j];
+                    }
+                }
+                if (d == 0.0f) {
+                    d = 1e-6f;
+                }
+                id = 1.0f / d;
+                int changed = 0;
+                for (int j = 0; j < QK_K; j++) {
+                    int t = lroundf(xb[j] * id);
+                    t = t < -1 ? -1 : (t > 1 ? 1 : t);
+                    if (t != T[j]) {
+                        T[j] = (int8_t)t;
+                        changed++;
+                    }
+                }
+                if (changed == 0) break;
+            }
+
+            block_tq1_0 * yb = &y[row * nb + i];
+            yb->d = GGML_FP32_TO_FP16(d);
+
+            // Pack ternary T[] in base-3, identical layout to quantize_row_tq1_0_ref.
+            // T[] is already clamped to {-1,0,+1}, so no overflow of the base-3 digits.
+            const int8_t * Tb = T;
+            // 5 elements per byte, along 32 bytes
+            for (size_t j = 0; j < sizeof(yb->qs) - sizeof(yb->qs) % 32; j += 32) {
+                for (size_t m = 0; m < 32; ++m) {
+                    uint8_t q = 0;
+                    for (size_t n = 0; n < 5; ++n) {
+                        int xi = Tb[m + n*32] + 1; // -1,0,1 -> 0,1,2
+                        q *= 3;
+                        q += xi;
+                    }
+                    q = ((uint16_t)q * 256 + (243 - 1)) / 243;
+                    yb->qs[j + m] = q;
+                }
+                Tb += 5*32;
+            }
+            // along 16 bytes
+            for (size_t j = sizeof(yb->qs) - sizeof(yb->qs) % 32; j < sizeof(yb->qs); j += 16) {
+                for (size_t m = 0; m < 16; ++m) {
+                    uint8_t q = 0;
+                    for (size_t n = 0; n < 5; ++n) {
+                        int xi = Tb[m + n*16] + 1;
+                        q *= 3;
+                        q += xi;
+                    }
+                    q = ((uint16_t)q * 256 + (243 - 1)) / 243;
+                    yb->qs[j + m] = q;
+                }
+                Tb += 5*16;
+            }
+            // 4 elements per byte
+            for (size_t j = 0; j < sizeof(yb->qh); ++j) {
+                uint8_t q = 0;
+                for (size_t m = 0; m < 4; ++m) {
+                    int xi = Tb[j + m*sizeof(yb->qh)] + 1;
+                    q *= 3;
+                    q += xi;
+                }
+                q *= 3; // shift first value to most significant trit
+                q = ((uint16_t)q * 256 + (243 - 1)) / 243;
+                yb->qh[j] = q;
+            }
+        }
+        x += n_per_row;
+    }
     return nrows * row_size;
 }
 
@@ -2462,25 +2578,33 @@ size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
             // 3-bit symmetric: 8 levels, centre at 4 (values 0..7 representing -4*d..+3*d)
             float d = amax / 4.0f;
 
-            // If imatrix is available, find scale minimizing importance-weighted MSE
-            if (wb && amax > 0.0f) {
-                float base_d = amax / 4.0f;
-                float best_d = base_d;
+            // Always pick the scale minimizing (importance-weighted) reconstruction
+            // error — NOT amax/4. With only 8 levels over a 256-wide block, a single
+            // outlier inflates amax and collapses the entire bulk to the zero level,
+            // which destroys peaked distributions like FFN weights (PPL -> ~21000).
+            // The MSE-optimal scale for such weights is a small fraction of amax/4, so
+            // we search a wide multiplicative range. Weight by imatrix when present,
+            // else uniformly.
+            if (amax > 0.0f) {
+                const float base_d = amax / 4.0f;
+                float best_d   = base_d;
                 float best_err = FLT_MAX;
-                for (int trial = 0; trial < 9; trial++) {
-                    float d_try = base_d * (0.8f + 0.05f * trial);
+                for (int trial = 0; trial < 40; trial++) {
+                    const float frac  = 0.05f + 0.03f * trial; // 0.05 .. 1.22 of amax/4
+                    const float d_try = base_d * frac;
                     if (d_try == 0.0f) continue;
-                    float id_try = 1.0f / d_try;
+                    const float id_try = 1.0f / d_try;
                     float err = 0.0f;
                     for (int j = 0; j < QK_K; j++) {
-                        float v = xb[j];
-                        int xi = MIN(7, MAX(0, (int)lroundf(v * id_try + 4.0f)));
-                        float recon = (xi - 4.0f) * d_try;
-                        err += wb[j] * (v - recon) * (v - recon);
+                        const float v     = xb[j];
+                        const int   xi    = MIN(7, MAX(0, (int)lroundf(v * id_try + 4.0f)));
+                        const float recon = (xi - 4.0f) * d_try;
+                        const float w     = wb ? wb[j] : 1.0f;
+                        err += w * (v - recon) * (v - recon);
                     }
                     if (err < best_err) {
                         best_err = err;
-                        best_d = d_try;
+                        best_d   = d_try;
                     }
                 }
                 d = best_d;
@@ -2526,25 +2650,31 @@ size_t quantize_tq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 
             float d = amax / 8.0f;
 
-            // If imatrix is available, find scale minimizing importance-weighted MSE
-            if (wb && amax > 0.0f) {
-                float base_d = amax / 8.0f;
-                float best_d = base_d;
+            // Always pick the scale minimizing (importance-weighted) reconstruction
+            // error — NOT amax/8. As with TQ3_0, a single outlier inflates amax and
+            // pushes the bulk toward the zero level; with only 16 levels over a
+            // 256-wide block the MSE-optimal scale is often a fraction of amax/8.
+            // Search a wide multiplicative range, imatrix-weighted when present.
+            if (amax > 0.0f) {
+                const float base_d = amax / 8.0f;
+                float best_d   = base_d;
                 float best_err = FLT_MAX;
-                for (int trial = 0; trial < 9; trial++) {
-                    float d_try = base_d * (0.8f + 0.05f * trial);
+                for (int trial = 0; trial < 40; trial++) {
+                    const float frac  = 0.05f + 0.03f * trial; // 0.05 .. 1.22 of amax/8
+                    const float d_try = base_d * frac;
                     if (d_try == 0.0f) continue;
-                    float id_try = 1.0f / d_try;
+                    const float id_try = 1.0f / d_try;
                     float err = 0.0f;
                     for (int j = 0; j < QK_K; j++) {
-                        float v = xb[j];
-                        int xi = MIN(15, MAX(0, (int)lroundf(v * id_try + 8.0f)));
-                        float recon = (xi - 8.0f) * d_try;
-                        err += wb[j] * (v - recon) * (v - recon);
+                        const float v     = xb[j];
+                        const int   xi    = MIN(15, MAX(0, (int)lroundf(v * id_try + 8.0f)));
+                        const float recon = (xi - 8.0f) * d_try;
+                        const float w     = wb ? wb[j] : 1.0f;
+                        err += w * (v - recon) * (v - recon);
                     }
                     if (err < best_err) {
                         best_err = err;
-                        best_d = d_try;
+                        best_d   = d_try;
                     }
                 }
                 d = best_d;

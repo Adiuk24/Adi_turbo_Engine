@@ -780,6 +780,17 @@ run_convert() {
         log "quantizing with imatrix (${quant_type})"
         "${BIN_DIR}/llama-quantize" --imatrix "${imatrix}" --token-embedding-type "${embed_type}" "${f16_model}" "${out_model}" "${quant_type}"
     else
+        # TQ (TurboQuant) formats are low-bit and depend on an importance matrix to
+        # pick per-block scales. Without one the FFN weights collapse to ~zero and the
+        # model produces garbage (measured PPL ~3300+ vs ~9 with imatrix). Refuse
+        # rather than silently ship a broken model. Pass --calibration <text> to
+        # generate one automatically, --imatrix <file> to supply one, or --force to
+        # override (only sensible for high-bit non-TQ types).
+        local qt_upper
+        qt_upper="$(printf '%s' "${quant_type}" | tr '[:lower:]' '[:upper:]')"
+        if [[ "${qt_upper}" == TQ* && "${force}" != "1" && "${force}" != "true" ]]; then
+            die "refusing to quantize ${quant_type} without an imatrix — it produces a broken model. Provide --calibration <text-file> (auto-generates one) or --imatrix <file>. Use --force to override."
+        fi
         warn "quantizing without imatrix (${quant_type})"
         "${BIN_DIR}/llama-quantize" --token-embedding-type "${embed_type}" "${f16_model}" "${out_model}" "${quant_type}"
     fi
