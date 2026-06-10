@@ -1277,67 +1277,17 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 void ggml_vec_dot_tq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
 
-    const block_tq4_0 * GGML_RESTRICT x = vx;
-    const block_q8_K  * GGML_RESTRICT y = vy;
-
-    const int nb = n / QK_K;
-
-#if defined(__AVX2__)
-    __m256 sumf = _mm256_setzero_ps();
-    const __m256i mask = _mm256_set1_epi8(0x0F);
-
-    const __m256i ones = _mm256_set1_epi16(1);
-
-    for (int i = 0; i < nb; ++i) {
-        // Accumulate in 32-bit to avoid int16 overflow.
-        // Max per maddubs lane = 2*15*127 = 3810; 4 iters * 2 accumulators
-        // can reach 30480+16256 = 46736 in 16-bit after bsums correction.
-        __m256i sumi0 = _mm256_setzero_si256();
-        __m256i sumi1 = _mm256_setzero_si256();
-
-        for (int j = 0; j < QK_K/2; j += 32) {
-            // Load 32 packed bytes = 64 4-bit values
-            const __m256i qx = _mm256_loadu_si256((const __m256i *)(x[i].qs + j));
-
-            // Extract low and high nibbles
-            const __m256i qx0 = _mm256_and_si256(qx, mask);
-            const __m256i qx1 = _mm256_and_si256(_mm256_srli_epi16(qx, 4), mask);
-
-            // Load corresponding 8-bit activations
-            const __m256i qy0 = _mm256_loadu_si256((const __m256i *)(y[i].qs + 2*j));
-            const __m256i qy1 = _mm256_loadu_si256((const __m256i *)(y[i].qs + 2*j + 32));
-
-            // maddubs -> 16-bit, then madd(ones) -> 32-bit to avoid overflow
-            sumi0 = _mm256_add_epi32(sumi0, _mm256_madd_epi16(_mm256_maddubs_epi16(qx0, qy0), ones));
-            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(qx1, qy1), ones));
-        }
-
-        // Offset correction in 32-bit: subtract 8 * sum(y)
-        const __m256i ysum = _mm256_loadu_si256((const __m256i *) y[i].bsums);
-        const __m256 d = _mm256_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d));
-
-        // Widen bsums to 32-bit, multiply by 8, subtract
-        const __m256i ysum32_lo = _mm256_madd_epi16(ysum, _mm256_set1_epi16(1));
-        const __m256i bsums_x8 = _mm256_slli_epi32(ysum32_lo, 3);
-
-        __m256i sumi = _mm256_add_epi32(sumi0, sumi1);
-        sumi = _mm256_sub_epi32(sumi, bsums_x8);
-
-        sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi), d), sumf);
-    }
-
-    *s = hsum_float_8(sumf);
-#else
-    UNUSED(x);
-    UNUSED(y);
-    UNUSED(nb);
+    // NOTE: the previous AVX2 fast path produced wrong results (test-quantize-fns
+    // "tq4_0 dot product error" ~1.06 on x86). TQ4_0 packs element 2j in the low
+    // nibble and 2j+1 in the high nibble of qs[j], so the low/high nibbles of a
+    // 32-byte chunk are the EVEN / ODD elements interleaved. The kernel paired
+    // them with sequential (first-half/second-half) activation lanes instead of
+    // the deinterleaved even/odd lanes, so every lane > 0 was mismatched. Until a
+    // correct, deinterleaving AVX2 kernel is written and validated on x86, defer
+    // to the scalar reference, which is correct. (The ARM NEON path deinterleaves
+    // via vzipq and is unaffected.)
     ggml_vec_dot_tq4_0_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
-#endif
 }
 
 void ggml_vec_dot_tq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
