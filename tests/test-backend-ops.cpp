@@ -7296,6 +7296,10 @@ static const ggml_type all_types[] = {
 
 static const ggml_type base_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16,
+    // TurboQuant weight formats — keep cross-backend (CPU vs Metal) coverage.
+    // TQ3_S deliberately excluded: its Metal mul_mv fails on permuted batched
+    // layouts (per=[0,2,1,3]/[0,3,2,1]) — add it back when that kernel is fixed.
+    GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GGML_TYPE_TQ3_0, GGML_TYPE_TQ4_0,
     GGML_TYPE_Q8_0, // for I8MM tests
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests

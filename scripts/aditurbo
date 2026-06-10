@@ -775,6 +775,18 @@ run_convert() {
         "${BIN_DIR}/llama-imatrix" -m "${f16_model}" -f "${calibration}" --chunks "${chunks}" -c "${ctx}" -ngl "${ngl}" -t "${threads}" -b 256 -ub 256 -o "${imatrix}" --output-format gguf
     fi
 
+    local qt_upper
+    qt_upper="$(printf '%s' "${quant_type}" | tr '[:lower:]' '[:upper:]')"
+
+    # Ternary formats encode only {-1,0,+1} per weight. They are near-lossless for
+    # QAT/BitNet-style models trained with ternary weights, but post-training
+    # quantization of a normal model is unusable even WITH an imatrix
+    # (measured: TQ2_0+imatrix PPL ~1400 vs Q2_K+imatrix ~12 on the same model).
+    if [[ "${qt_upper}" == "TQ1_0" || "${qt_upper}" == "TQ2_0" ]]; then
+        warn "${quant_type} is a ternary format: only suitable for QAT/BitNet-trained models."
+        warn "Post-training quantization of a standard model WILL produce garbage (use TQ3_0/TQ4_0 instead)."
+    fi
+
     if [[ -n "${imatrix}" ]]; then
         require_file "${imatrix}"
         log "quantizing with imatrix (${quant_type})"
@@ -786,8 +798,6 @@ run_convert() {
         # rather than silently ship a broken model. Pass --calibration <text> to
         # generate one automatically, --imatrix <file> to supply one, or --force to
         # override (only sensible for high-bit non-TQ types).
-        local qt_upper
-        qt_upper="$(printf '%s' "${quant_type}" | tr '[:lower:]' '[:upper:]')"
         if [[ "${qt_upper}" == TQ* && "${force}" != "1" && "${force}" != "true" ]]; then
             die "refusing to quantize ${quant_type} without an imatrix — it produces a broken model. Provide --calibration <text-file> (auto-generates one) or --imatrix <file>. Use --force to override."
         fi
