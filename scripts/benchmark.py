@@ -2,11 +2,12 @@
 """Quick benchmark for AdiTurbo models via chat completions API.
 Runs MMLU, GSM8K, ARC subsets and reports accuracy vs published baselines."""
 
-import json, re, sys, time
+import json, os, re, sys, time
 from urllib.request import Request, urlopen
 
-API = "http://localhost:8081/v1/chat/completions"
-MODEL = "gemma4"
+# Defaults match `aditurbo ui` (port 11434); override via env.
+API = os.environ.get("ADITURBO_API", "http://localhost:11434/v1/chat/completions")
+MODEL = os.environ.get("ADITURBO_MODEL", "gemma4")
 
 def ask(prompt, max_tokens=50):
     body = json.dumps({

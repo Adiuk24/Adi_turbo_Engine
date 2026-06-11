@@ -38,13 +38,25 @@ THREAD_COUNTS=$(echo "$THREAD_COUNTS" | tr ' ' '\n' | sort -un | tr '\n' ' ')
 echo "Thread counts to test: $THREAD_COUNTS"
 echo "Prompt sizes: $PROMPT_SIZES"
 echo "Generation sizes: $GEN_SIZES"
+# Parse avg_ts (tokens/sec) out of llama-bench JSON output.
+bench_ts() {
+    "$BENCH" "$@" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+    print(f"{rows[0][\"avg_ts\"]:.2f} t/s")
+except Exception:
+    print("FAILED")
+'
+}
+
 echo ""
 echo "--- Prompt Processing (pp) ---"
 
 for t in $THREAD_COUNTS; do
     for pp in $PROMPT_SIZES; do
         echo -n "threads=$t pp=$pp: "
-        $BENCH -m "$MODEL" -p "$pp" -n 0 -ngl "$NGL" -t "$t" -r 1 2>/dev/null | grep -oE '[0-9]+\.[0-9]+ tokens per second' | head -1 || echo "FAILED"
+        bench_ts -m "$MODEL" -p "$pp" -n 0 -ngl "$NGL" -t "$t" -r 1
     done
 done
 
@@ -54,7 +66,7 @@ echo "--- Token Generation (tg) ---"
 for t in $THREAD_COUNTS; do
     for tg in $GEN_SIZES; do
         echo -n "threads=$t tg=$tg: "
-        $BENCH -m "$MODEL" -p 0 -n "$tg" -ngl "$NGL" -t "$t" -r 1 2>/dev/null | grep -oE '[0-9]+\.[0-9]+ tokens per second' | head -1 || echo "FAILED"
+        bench_ts -m "$MODEL" -p 0 -n "$tg" -ngl "$NGL" -t "$t" -r 1
     done
 done
 

@@ -166,6 +166,24 @@ llama_context::llama_context(
     cparams.turbo_kv_qjl = params.turbo_kv_qjl;
     cparams.turbo_kv_proj_dim = params.turbo_kv_proj_dim;
 
+    // The Turbo-KV QJL residual path has known correctness defects (V-tail is
+    // zeroed instead of projected, a shared static quant-param struct, and a
+    // V rotation hard-coded to 64x64 that is wrong for n_embd_head_v != 64).
+    // It silently corrupts the KV cache, so refuse to run it unless the user
+    // explicitly opts into the experimental path. Plain --turbo-kv (no QJL) is
+    // a graph no-op and remains allowed.
+    if (cparams.turbo_kv_qjl) {
+        const char * allow = getenv("ADITURBO_ENABLE_EXPERIMENTAL_QJL");
+        if (!allow || atoi(allow) == 0) {
+            throw std::runtime_error(
+                "Turbo-KV QJL path is experimental and known to corrupt the KV cache "
+                "(see docs/turboquant-kv-cache-design.md). Refusing to enable it. "
+                "Set ADITURBO_ENABLE_EXPERIMENTAL_QJL=1 to override at your own risk.");
+        }
+        LLAMA_LOG_WARN("%s: Turbo-KV QJL enabled via ADITURBO_ENABLE_EXPERIMENTAL_QJL — "
+                       "known to corrupt the KV cache; results are unreliable.\n", __func__);
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -354,6 +372,23 @@ llama_context::llama_context(
 
         if (!cparams.flash_attn && ggml_is_quantized(params.type_v)) {
             LLAMA_LOG_WARN("%s: quantized V cache active without flash_attn; non-flash fallback path enabled\n", __func__);
+        }
+
+        // TQ3_S KV cache requires the Metal SET_ROWS/CPY kernels — there is no
+        // CPU/CUDA/Vulkan implementation, so it would crash at cache-write time
+        // on any non-Metal backend. Fail clearly at init instead.
+        if (params.type_k == GGML_TYPE_TQ3_S || params.type_v == GGML_TYPE_TQ3_S) {
+            bool has_metal = false;
+            for (auto & backend : backends) {
+                const char * bname = ggml_backend_name(backend.get());
+                if (bname && strstr(bname, "Metal")) { has_metal = true; break; }
+            }
+            if (!has_metal) {
+                throw std::runtime_error(
+                    "TQ3_S KV cache type is only implemented for the Metal backend; "
+                    "it has no CPU/CUDA/Vulkan kernels and would crash on write. "
+                    "Use a different -ctk/-ctv type (e.g. q8_0) on this backend.");
+            }
         }
     }
 

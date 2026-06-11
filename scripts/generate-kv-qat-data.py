@@ -8,12 +8,13 @@ The goal: the model will be fine-tuned with TQ3_S KV cache simulation
 so it learns to produce activations that survive 3-bit compression.
 """
 
-import json, sys, time
+import json, os, sys, time
 from urllib.request import Request, urlopen
 
-API = "http://localhost:8081/v1/chat/completions"
-MODEL = "gemma4"
-OUTPUT = "/Users/adi/noor/data/kv-qat-distill.jsonl"
+# Configurable via env or argv: generate-kv-qat-data.py [output.jsonl]
+API = os.environ.get("ADITURBO_API", "http://localhost:11434/v1/chat/completions")
+MODEL = os.environ.get("ADITURBO_MODEL", "gemma4")
+OUTPUT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ADITURBO_QAT_OUT", "kv-qat-distill.jsonl")
 
 # Diverse prompts covering all capabilities Eyla needs
 PROMPTS = [

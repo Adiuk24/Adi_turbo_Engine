@@ -5,6 +5,9 @@ exclude =
     # Do not traverse examples and tools
     examples,
     tools,
+    # AdiTurbo operational helper scripts (benchmark/calibration/data-gen) —
+    # utility scripts, excluded like examples/tools above, not core library code
+    scripts,
     # Do not include package initializers
     __init__.py,
     # No need to traverse our git directory

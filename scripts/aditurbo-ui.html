@@ -512,6 +512,7 @@
     const qs = new URLSearchParams(window.location.search);
     const presetApi = qs.get("api") || "http://127.0.0.1:11434";
     const presetModel = qs.get("model") || "";
+    const apiToken = qs.get("token") || "";
 
     const el = {
       window: document.getElementById("window"),
@@ -830,7 +831,7 @@
       try {
         const res = await fetch(`/api/convert`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-AdiTurbo-Token": apiToken },
           body: JSON.stringify(payload)
         });
         const json = await res.json();

@@ -498,7 +498,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         // MoE expert tensors included — AdiTurbo's whole point is extreme compression.
         // Only exception: MoE router gate (ffn_gate_inp) stays Q4_K to preserve routing.
         const bool is_tq4 = ftype == LLAMA_FTYPE_MOSTLY_TQ4_0;
-        const bool is_tq3 = ftype == LLAMA_FTYPE_MOSTLY_TQ3_0;
+        [[maybe_unused]] const bool is_tq3 = ftype == LLAMA_FTYPE_MOSTLY_TQ3_0;
         const bool is_moe = qs.model.hparams.n_expert >= 4;
         if (category_is_attn_v(category)) {
             // Attention V: one step above baseline for quality

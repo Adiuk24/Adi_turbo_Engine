@@ -27,8 +27,12 @@ llm_build_afmoe::llm_build_afmoe(const llama_model & model, const llm_graph_para
 
         ggml_tensor * inpSA = inpL;
 
-        // This overlaps with SWA layers in current models, so get_rope_freq_base/scale may be superfluous
-        const bool use_rope = hparams.n_no_rope_layer_step > 0 &&
+        // AfMoE applies RoPE on ALL layers: n_no_rope_layer_step == 0 means "no
+        // layer skips RoPE" (set in load_hparams). The Llama4-style skip only
+        // applies when the step is > 0. (Bug fix: the old `step > 0 && ...` form
+        // disabled RoPE on every layer when step==0, leaving inp_pos unused and
+        // unallocated — a crash when its input was set.)
+        const bool use_rope = hparams.n_no_rope_layer_step == 0 ||
                               (il + 1) % hparams.n_no_rope_layer_step != 0;
 
         // dual attention normalization (pre)

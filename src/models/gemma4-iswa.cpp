@@ -278,8 +278,16 @@ ggml_tensor * llm_build_gemma4_iswa::build_inp_per_layer() {
 
         res->add_input(std::move(inp));
     } else {
-        // Multimodal embedding path: use padding token (ID=0) embedding
-        // TODO: verify if this is the correct behavior in transformers implementation
+        // Multimodal (embedding) path. The per-layer embeddings are normally a
+        // per-token table lookup, but this ubatch carries precomputed image/audio
+        // embeddings (ubatch.embd) with NO token ids, so get_rows is not possible.
+        // KNOWN LIMITATION: HF Gemma applies a learned per-layer projection to the
+        // image embeddings here; we instead substitute the padding-token (ID=0)
+        // per-layer embedding for every multimodal position. This is a coarse
+        // approximation — image/audio positions get uniform, non-content per-layer
+        // conditioning. Correct handling needs the per-layer projection implemented
+        // and validated against a multimodal reference. Do not mistake this for a
+        // simple get_rows fix: there are no token ids in this path.
         const int64_t embd_size = model.per_layer_tok_embd->ne[0];  // n_embd_per_layer * n_layer
 
         // Extract and dequantize padding token embedding (row 0)
