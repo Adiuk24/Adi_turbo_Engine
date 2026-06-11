@@ -7996,6 +7996,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // TQ4_0: targeted MUL_MAT coverage for the CPU vec_dot kernel (AVX2/NEON).
+    // Deliberately NOT added to the shared all_types[] array: that array also
+    // drives get_rows/cpy tests which CUDA/Vulkan/WebGPU do not implement for TQ
+    // types and would break their CI (see the all_types/base_types note above).
+    // These targeted cases skip cleanly on backends without TQ4_0 mul_mat support.
+    // n == 1 exercises the ggml_vec_dot_tq4_0_q8_K path directly; k is a multiple
+    // of QK_K (256). NOTE: on the CPU backend this compares CPU-vs-CPU, so it is a
+    // plumbing/consistency check; the authoritative kernel-correctness gate is
+    // test-quantize-fns ("tq4_0 dot product error"), which dots SIMD vs scalar.
+    for (int i = 1; i < 10; ++i) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_0, GGML_TYPE_F32, 16,  i,  256, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_0, GGML_TYPE_F32, 256, 1, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_0, GGML_TYPE_F32, 256, 8, 1024, {1, 1}, {1, 1}));
+
 #if 0
     {
         // Test paths in OpenCL
