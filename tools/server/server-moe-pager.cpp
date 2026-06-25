@@ -58,6 +58,13 @@ static std::string        g_sock_path;
 static std::atomic<uint64_t> g_evict_calls{0};
 static std::atomic<uint64_t> g_prefetch_calls{0};
 
+// ── Hint mode (set via PAGER_HINT_MODE env var before server start) ───────────
+//   A0 = 0 : no madvise hints (pure demand-fault baseline)
+//   A1 = 1 : MADV_WILLNEED only  (prefetch, no eviction)
+//   A2 = 2 : MADV_DONTNEED only  (eviction, no prefetch)
+//   A3 = 3 : both WILLNEED + DONTNEED (default, production setting)
+static int g_hint_mode = 3;
+
 // ── Residency snapshot (SNAPSHOT / DIFF commands) ─────────────────────────────
 //
 // Each layer's gate tensor covers all n_experts contiguously:
@@ -171,21 +178,25 @@ static void advise_region(void * ptr, size_t size, int advice) {
 static void evict_expert(int layer, int expert) {
     if (layer < 0 || layer >= g_layout.n_layer)   return;
     if (expert < 0 || expert >= g_layout.n_experts) return;
+    g_evict_calls++;
+    // A0 or A1: DONTNEED suppressed
+    if (g_hint_mode != 2 && g_hint_mode != 3) return;
     const auto & r = g_layout.regions[layer][expert];
     advise_region(r.down_ptr, r.down_size, MADV_DONTNEED);
     advise_region(r.gate_ptr, r.gate_size, MADV_DONTNEED);
     advise_region(r.up_ptr,   r.up_size,   MADV_DONTNEED);
-    g_evict_calls++;
 }
 
 static void prefetch_expert(int layer, int expert) {
     if (layer < 0 || layer >= g_layout.n_layer)   return;
     if (expert < 0 || expert >= g_layout.n_experts) return;
+    g_prefetch_calls++;
+    // A0 or A2: WILLNEED suppressed
+    if (g_hint_mode != 1 && g_hint_mode != 3) return;
     const auto & r = g_layout.regions[layer][expert];
     advise_region(r.down_ptr, r.down_size, MADV_WILLNEED);
     advise_region(r.gate_ptr, r.gate_size, MADV_WILLNEED);
     advise_region(r.up_ptr,   r.up_size,   MADV_WILLNEED);
-    g_prefetch_calls++;
 }
 
 #else  // !MOE_PAGER_SUPPORTED
@@ -379,6 +390,14 @@ bool moe_pager_init(const struct llama_context * ctx) {
             __func__, n_layer, n_experts,
             (double)(e0.down_size + e0.gate_size + e0.up_size) / 1024.0 / 1024.0,
             e0.down_size, e0.gate_size, e0.up_size);
+
+    // Read ablation mode (E3 experiment: PAGER_HINT_MODE=0..3)
+    if (const char * m = getenv("PAGER_HINT_MODE")) {
+        int v = atoi(m);
+        g_hint_mode = (v >= 0 && v <= 3) ? v : 3;
+    }
+    static const char * mode_names[] = {"no hints", "WILLNEED only", "DONTNEED only", "WILLNEED+DONTNEED"};
+    LOG_INF("%s: hint mode A%d (%s)\n", __func__, g_hint_mode, mode_names[g_hint_mode]);
 
 #if MOE_PAGER_SUPPORTED
     // Pre-allocate snapshot / mincore buffers so SNAPSHOT/DIFF are ready immediately
