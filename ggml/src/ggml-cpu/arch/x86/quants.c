@@ -1277,17 +1277,80 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 void ggml_vec_dot_tq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
 
-    // NOTE: the previous AVX2 fast path produced wrong results (test-quantize-fns
-    // "tq4_0 dot product error" ~1.06 on x86). TQ4_0 packs element 2j in the low
-    // nibble and 2j+1 in the high nibble of qs[j], so the low/high nibbles of a
-    // 32-byte chunk are the EVEN / ODD elements interleaved. The kernel paired
-    // them with sequential (first-half/second-half) activation lanes instead of
-    // the deinterleaved even/odd lanes, so every lane > 0 was mismatched. Until a
-    // correct, deinterleaving AVX2 kernel is written and validated on x86, defer
-    // to the scalar reference, which is correct. (The ARM NEON path deinterleaves
-    // via vzipq and is unaffected.)
+    const block_tq4_0 * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+#if defined(__AVX2__)
+    // TQ4_0 packs element (2j) in the low nibble and (2j+1) in the high nibble of
+    // qs[j]. Across a 32-byte qs chunk the low nibbles are the EVEN-indexed
+    // elements and the high nibbles are the ODD-indexed elements, interleaved.
+    // The matching q8_K activations y.qs[] are stored sequentially by element
+    // index, so the nibbles must be re-interleaved back into element order before
+    // the dot product (this mirrors the ARM NEON vzipq path). AVX2 unpack works
+    // per 128-bit lane, so the lane-crossing is fixed up with permute2x128.
+    //
+    // The earlier kernel dotted the low-nibble vector against y.qs[2j..2j+31] and
+    // the high-nibble vector against y.qs[2j+32..2j+63] (first-half/second-half),
+    // which mismatched every element beyond lane 0 -> dot product error ~1.06.
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        // int32 accumulator: int16 maddubs partials would overflow over a block.
+        __m256i isum = _mm256_setzero_si256();
+
+        // QK_K/2 = 128 nibble-bytes => 4 chunks of 32 bytes; each chunk covers
+        // 64 sequential activations (two 256-bit y loads).
+        for (int j = 0; j < QK_K/2; j += 32) {
+            const __m256i xq  = _mm256_loadu_si256((const __m256i *)(x[i].qs + j));
+            const __m256i xlo = _mm256_and_si256(xq, m4);                              // 32 even-element nibbles
+            const __m256i xhi = _mm256_and_si256(_mm256_srli_epi16(xq, 4), m4);        // 32 odd-element nibbles
+
+            // re-interleave nibbles into element order (within each 128-bit lane)
+            const __m256i z0 = _mm256_unpacklo_epi8(xlo, xhi);
+            const __m256i z1 = _mm256_unpackhi_epi8(xlo, xhi);
+
+            // recombine across lanes to recover contiguous element order
+            const __m256i xv0 = _mm256_permute2x128_si256(z0, z1, 0x20);  // elements 2j   .. 2j+31
+            const __m256i xv1 = _mm256_permute2x128_si256(z0, z1, 0x31);  // elements 2j+32 .. 2j+63
+
+            const __m256i yv0 = _mm256_loadu_si256((const __m256i *)(y[i].qs + 2*j +  0));
+            const __m256i yv1 = _mm256_loadu_si256((const __m256i *)(y[i].qs + 2*j + 32));
+
+            // maddubs: x nibbles are unsigned [0..15], y activations are signed int8.
+            // Each product <= 15*127 = 1905, adjacent pair sum <= 3810 (fits int16).
+            const __m256i p0 = _mm256_maddubs_epi16(xv0, yv0);
+            const __m256i p1 = _mm256_maddubs_epi16(xv1, yv1);
+
+            // promote int16 partials to int32 and accumulate
+            isum = _mm256_add_epi32(isum, _mm256_madd_epi16(_mm256_add_epi16(p0, p1), _mm256_set1_epi16(1)));
+        }
+
+        // unsigned-nibble offset correction: the stored value is (real + 8), so
+        // subtract 8 * sum(y over the block). sum(bsums) == sum of all 256 y.qs.
+        int32_t ysum = 0;
+        for (int k = 0; k < QK_K/16; ++k) {
+            ysum += y[i].bsums[k];
+        }
+
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        sumf += d * (float)(hsum_i32_8(isum) - 8 * ysum);
+    }
+
+    *s = sumf;
+#else
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
     ggml_vec_dot_tq4_0_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
 }
 
 void ggml_vec_dot_tq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
