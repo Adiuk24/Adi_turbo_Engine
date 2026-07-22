@@ -2560,6 +2560,49 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_NOOR:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // GDN (gated delta net) recurrent layers: 3 separate (Q,K,V) depthwise
+                // causal convs + one square [head_dim,head_dim] recurrent state per head.
+                // The checkpoint's native layout is 12 heads x head_dim=128 (q/k) vs
+                // head_dim=256 (v, expand_v=2.0), but the in-tree delta-net kernel
+                // (delta-net-base.cpp) hard-asserts S_k==S_v (square per-head state), so
+                // the converter repacks q/k/v (and the per-head scalars beta/alpha/A_log/
+                // dt_bias) into 24 heads of width 128 before writing the GGUF -- each
+                // original head's low/high 128-wide v-halves become two square-state
+                // sub-heads that share the same q/k/beta/gate (see
+                // noor_hybrid/convert_noor_gguf.py). ssm_n_group below holds that
+                // repacked head count (24), NOT the checkpoint's native head count (12).
+                // ssm_d_inner MUST equal ssm_n_group*ssm_d_state: llama_hparams::n_embd_r()/
+                // n_embd_s()'s generic (Mamba-style) formulas are reused unmodified and
+                // only come out to the right sizes (3 separate convs; one state per head)
+                // under that identity -- see the session report for the derivation.
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+                ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+                ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+
+                // Mark recurrent (GDN) layers: block i is full-attn iff (i+1) % interval == 0
+                {
+                    uint32_t full_attn_interval = 4;
+                    ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                    }
+                }
+
+                ml.get_key(LLM_KV_EXPERT_COUNT,                      hparams.n_expert);
+                ml.get_key(LLM_KV_EXPERT_USED_COUNT,                 hparams.n_expert_used);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
+
+                switch (hparams.n_layer) {
+                    case 24: type = LLM_TYPE_1B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_STEP35:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -7370,6 +7413,84 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), { n_ff_shexp, n_embd }, 0);
                     }
                 } break;
+            case LLM_ARCH_NOOR:
+                {
+                    if (n_expert == 0) {
+                        throw std::runtime_error(arch_name() + " model cannot have zero experts");
+                    }
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), { n_embd, n_vocab }, 0);
+
+                    const int64_t n_ff_exp   = hparams.n_ff_exp;
+                    const int64_t n_ff_shexp = hparams.n_ff_shexp;
+
+                    // GDN (recurrent) layer dims -- 12-native-head checkpoint repacked to
+                    // 24 square-state heads by the converter; see the hparam-loading
+                    // comment above for the full rationale.
+                    const int64_t head_dim_gdn = hparams.ssm_d_state;      // 128
+                    const int64_t n_head_gdn   = hparams.ssm_n_group;      // 24
+                    const int64_t d_inner_gdn  = head_dim_gdn * n_head_gdn; // 3072
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        // sandwich norms, every layer: x = x + ds*norm_post(sublayer(norm_pre(x)))
+                        // (ds folded into the *_post weights by the converter)
+                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
+                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
+                        layer.ffn_norm       = create_tensor(tn(LLM_TENSOR_FFN_NORM,       "weight", i), { n_embd }, 0);
+                        layer.ffn_post_norm  = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM,  "weight", i), { n_embd }, 0);
+
+                        if (!hparams.is_recurrent(i)) {
+                            // GQA full-attn layer: qkv+bias, no bias on o, no qk-norm, full-dim RoPE
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
+
+                            layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", i), { n_embd_head_k * n_head }, 0);
+                            layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", i), { n_embd_k_gqa }, 0);
+                            layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", i), { n_embd_v_gqa }, 0);
+                        } else {
+                            // GDN layer: separate depthwise Q/K/V convs + separate
+                            // single-matrix alpha/beta projections, all pre-repacked to
+                            // n_head_gdn=24 / head_dim_gdn=128 by the converter.
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, d_inner_gdn }, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, d_inner_gdn }, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, d_inner_gdn }, 0);
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { d_inner_gdn, n_embd }, 0);
+
+                            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), { n_embd, d_inner_gdn }, 0);
+
+                            layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), { hparams.ssm_d_conv, 1, d_inner_gdn }, 0);
+                            layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", i), { hparams.ssm_d_conv, 1, d_inner_gdn }, 0);
+                            layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", i), { hparams.ssm_d_conv, 1, d_inner_gdn }, 0);
+
+                            layer.ssm_alpha = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "weight", i), { n_embd, n_head_gdn }, 0);
+                            layer.ssm_beta  = create_tensor(tn(LLM_TENSOR_SSM_BETA,  "weight", i), { n_embd, n_head_gdn }, 0);
+                            layer.ssm_a     = create_tensor(tn(LLM_TENSOR_SSM_A,     "weight", i), { n_head_gdn }, 0);
+                            layer.ssm_dt    = create_tensor(tn(LLM_TENSOR_SSM_DT,    "bias",   i), { n_head_gdn }, 0);
+
+                            // gated-RMSNorm weight, pre-tiled [head_dim_gdn, n_head_gdn] by
+                            // the converter (eps=1e-5, applied via a direct ggml_rms_norm
+                            // call in the graph builder -- NOT build_norm's shared
+                            // hparams.f_norm_rms_eps=1e-6).
+                            layer.ssm_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), { head_dim_gdn, n_head_gdn }, 0);
+                        }
+
+                        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert }, 0);
+                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), { n_embd, n_ff_exp, n_expert }, 0);
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+
+                        // always-on shared SwiGLU expert, no external gate (plain add, like deepseek2)
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), { n_embd, n_ff_shexp }, 0);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), { n_embd, n_ff_shexp }, 0);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), { n_ff_shexp, n_embd }, 0);
+                    }
+                } break;
             case LLM_ARCH_QWEN35MOE:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
@@ -8069,7 +8190,8 @@ void llama_model::print_info() const {
         arch == LLM_ARCH_QWEN35 ||
         arch == LLM_ARCH_QWEN35MOE ||
         arch == LLM_ARCH_NEMOTRON_H ||
-        arch == LLM_ARCH_NEMOTRON_H_MOE) {
+        arch == LLM_ARCH_NEMOTRON_H_MOE ||
+        arch == LLM_ARCH_NOOR) {
         LLAMA_LOG_INFO("%s: ssm_d_conv            = %u\n",     __func__, hparams.ssm_d_conv);
         LLAMA_LOG_INFO("%s: ssm_d_inner           = %u\n",     __func__, hparams.ssm_d_inner);
         LLAMA_LOG_INFO("%s: ssm_d_state           = %u\n",     __func__, hparams.ssm_d_state);
@@ -8919,6 +9041,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_kimi_linear>(*this, params);
             } break;
+        case LLM_ARCH_NOOR:
+            {
+                llm = std::make_unique<llm_build_noor>(*this, params);
+            } break;
         case LLM_ARCH_STEP35:
             {
                 llm = std::make_unique<llm_build_step35_iswa>(*this, params);
@@ -9175,6 +9301,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_NOOR:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:

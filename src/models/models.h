@@ -387,6 +387,31 @@ struct llm_build_kimi_linear : public llm_build_delta_net_base {
     const llama_model & model;
 };
 
+// Noor-Edge: 24-layer Gated-DeltaNet(18)/GQA(6) 3:1 hybrid + MoE (noor_hybrid/mac_infer.py
+// is the oracle this mirrors; see noor_hybrid/convert_noor_gguf.py for the checkpoint ->
+// GGUF tensor repacking this graph assumes).
+struct llm_build_noor : public llm_build_delta_net_base {
+    llm_build_noor(const llama_model & model, const llm_graph_params & params);
+
+private:
+    ggml_tensor * build_layer_attn(
+    llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                        int   il);
+
+    ggml_tensor * build_layer_delta_net(
+         llm_graph_input_rs * inp,
+                ggml_tensor * cur,
+                        int   il);
+
+    ggml_tensor * build_layer_ffn(
+                ggml_tensor * cur,
+                        int   il);
+
+    const llama_model & model;
+};
+
 template <bool iswa>
 struct llm_build_lfm2 : public llm_graph_context {
     llm_build_lfm2(const llama_model & model, const llm_graph_params & params);
