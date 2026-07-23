@@ -6193,6 +6193,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
     GGML_ASSERT(state->type == GGML_TYPE_F32);
 
+    const int64_t S_k      = q->ne[0];
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
     const int64_t n_tokens = v->ne[2];
@@ -6202,11 +6203,11 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
-    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(ggml_nelements(state) == S_k * S_v * H * n_seqs);
 
     // concat output and new_state into a single tensor
-    // output: S_v * H * n_tokens * n_seqs, state: S_v * S_v * H * n_seqs
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    // output: S_v * H * n_tokens * n_seqs, state: S_k * S_v * H * n_seqs
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_k * n_seqs, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_GATED_DELTA_NET;

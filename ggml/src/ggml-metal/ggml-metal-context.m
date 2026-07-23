@@ -3,8 +3,15 @@
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 
+#import "ggml-metal.h"
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
+
+#include <mach/mach_time.h>
+#include <stdatomic.h>
+
+static _Atomic double g_op_time[GGML_OP_COUNT];
+static _Atomic int g_op_count[GGML_OP_COUNT];
 #import "ggml-metal-ops.h"
 
 #import <Foundation/Foundation.h>

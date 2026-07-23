@@ -7427,12 +7427,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     const int64_t n_ff_exp   = hparams.n_ff_exp;
                     const int64_t n_ff_shexp = hparams.n_ff_shexp;
 
-                    // GDN (recurrent) layer dims -- 12-native-head checkpoint repacked to
-                    // 24 square-state heads by the converter; see the hparam-loading
-                    // comment above for the full rationale.
+                    // GDN (recurrent) layer dims
                     const int64_t head_dim_gdn = hparams.ssm_d_state;      // 128
-                    const int64_t n_head_gdn   = hparams.ssm_n_group;      // 24
-                    const int64_t d_inner_gdn  = head_dim_gdn * n_head_gdn; // 3072
+                    const int64_t n_head_gdn   = hparams.ssm_n_group;      // 12
+                    const int64_t d_inner_gdn  = hparams.ssm_d_inner;      // 3072
+                    const int64_t qk_dim_gdn   = head_dim_gdn * n_head_gdn; // 1536
 
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
@@ -7456,17 +7455,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", i), { n_embd_v_gqa }, 0);
                         } else {
                             // GDN layer: separate depthwise Q/K/V convs + separate
-                            // single-matrix alpha/beta projections, all pre-repacked to
-                            // n_head_gdn=24 / head_dim_gdn=128 by the converter.
-                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, d_inner_gdn }, 0);
-                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, d_inner_gdn }, 0);
+                            // single-matrix alpha/beta projections
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, qk_dim_gdn }, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, qk_dim_gdn }, 0);
                             layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, d_inner_gdn }, 0);
                             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { d_inner_gdn, n_embd }, 0);
 
                             layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), { n_embd, d_inner_gdn }, 0);
 
-                            layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), { hparams.ssm_d_conv, 1, d_inner_gdn }, 0);
-                            layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", i), { hparams.ssm_d_conv, 1, d_inner_gdn }, 0);
+                            layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), { hparams.ssm_d_conv, 1, qk_dim_gdn }, 0);
+                            layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", i), { hparams.ssm_d_conv, 1, qk_dim_gdn }, 0);
                             layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", i), { hparams.ssm_d_conv, 1, d_inner_gdn }, 0);
 
                             layer.ssm_alpha = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "weight", i), { n_embd, n_head_gdn }, 0);
@@ -7474,11 +7472,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ssm_a     = create_tensor(tn(LLM_TENSOR_SSM_A,     "weight", i), { n_head_gdn }, 0);
                             layer.ssm_dt    = create_tensor(tn(LLM_TENSOR_SSM_DT,    "bias",   i), { n_head_gdn }, 0);
 
-                            // gated-RMSNorm weight, pre-tiled [head_dim_gdn, n_head_gdn] by
-                            // the converter (eps=1e-5, applied via a direct ggml_rms_norm
-                            // call in the graph builder -- NOT build_norm's shared
-                            // hparams.f_norm_rms_eps=1e-6).
-                            layer.ssm_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), { head_dim_gdn, n_head_gdn }, 0);
+                            // gated-RMSNorm weight (eps=1e-5)
+                            layer.ssm_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), { d_inner_gdn / n_head_gdn }, 0);
                         }
 
                         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert }, 0);

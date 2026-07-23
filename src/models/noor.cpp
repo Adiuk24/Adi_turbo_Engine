@@ -27,17 +27,16 @@
 static ggml_tensor * causal_conv1d(
         ggml_cgraph * gf, ggml_context * ctx0,
         ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
-        int64_t qkv_idx, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
+        int64_t conv_state_offset, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
         int64_t d_conv, int64_t head_dim, int64_t n_head,
-        int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head) {
+        int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
+        int64_t n_embd_r_total) {
     const int64_t d_inner = head_dim * n_head;
-    const int64_t conv_state_size = (d_conv - 1) * d_inner;
-    const int64_t n_embd_r_total = 3 * conv_state_size; // Q + K + V
 
     ggml_tensor * conv_state_x = ggml_view_3d(ctx0, conv_state_all, d_conv - 1, d_inner, n_seqs,
         (d_conv - 1) * ggml_element_size(conv_state_all),
         n_embd_r_total * ggml_element_size(conv_state_all),
-        qkv_idx * conv_state_size * ggml_element_size(conv_state_all));
+        conv_state_offset * ggml_element_size(conv_state_all));
 
     ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
     ggml_tensor * x_3d = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
@@ -52,7 +51,7 @@ static ggml_tensor * causal_conv1d(
                 d_conv - 1, d_inner, n_seqs,
                 (d_conv - 1) * ggml_element_size(conv_states_all),
                 n_embd_r_total * ggml_element_size(conv_states_all),
-                (kv_head * n_embd_r_total + qkv_idx * conv_state_size) * ggml_element_size(conv_states_all))));
+                (kv_head * n_embd_r_total + conv_state_offset) * ggml_element_size(conv_states_all))));
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
     ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
@@ -208,22 +207,28 @@ ggml_tensor * llm_build_noor::build_layer_delta_net(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    const int64_t head_dim = hparams.ssm_d_state;  // 128, repacked
-    const int64_t n_head_g = hparams.ssm_n_group;  // 24,  repacked
-    const int64_t d_conv   = hparams.ssm_d_conv;   // 4
+    const int64_t head_dim_k = hparams.ssm_d_state;  // 128
+    const int64_t head_dim_v = hparams.ssm_d_inner / hparams.ssm_n_group; // 256
+    const int64_t n_head_g = hparams.ssm_n_group;    // 12
+    const int64_t d_conv   = hparams.ssm_d_conv;     // 4
+    const int64_t n_embd_r = hparams.n_embd_r();
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
-    ggml_tensor * conv_state_all  = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_state_all  = build_rs(inp, conv_states_all, n_embd_r, n_seqs);
 
-    ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur,
-            model.layers[il].wq, model.layers[il].ssm_q_conv, d_conv, head_dim, n_head_g,
-            n_seq_tokens, n_seqs, n_tokens, kv_head);
-    ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur,
-            model.layers[il].wk, model.layers[il].ssm_k_conv, d_conv, head_dim, n_head_g,
-            n_seq_tokens, n_seqs, n_tokens, kv_head);
-    ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur,
-            model.layers[il].wv, model.layers[il].ssm_v_conv, d_conv, head_dim, n_head_g,
-            n_seq_tokens, n_seqs, n_tokens, kv_head);
+    const int64_t offset_q = 0;
+    const int64_t offset_k = (d_conv - 1) * head_dim_k * n_head_g;
+    const int64_t offset_v = offset_k + (d_conv - 1) * head_dim_k * n_head_g;
+
+    ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, offset_q, cur,
+            model.layers[il].wq, model.layers[il].ssm_q_conv, d_conv, head_dim_k, n_head_g,
+            n_seq_tokens, n_seqs, n_tokens, kv_head, n_embd_r);
+    ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, offset_k, cur,
+            model.layers[il].wk, model.layers[il].ssm_k_conv, d_conv, head_dim_k, n_head_g,
+            n_seq_tokens, n_seqs, n_tokens, kv_head, n_embd_r);
+    ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, offset_v, cur,
+            model.layers[il].wv, model.layers[il].ssm_v_conv, d_conv, head_dim_v, n_head_g,
+            n_seq_tokens, n_seqs, n_tokens, kv_head, n_embd_r);
 
     const float eps_norm = hparams.f_norm_rms_eps;
     Qcur = ggml_l2_norm(ctx0, Qcur, eps_norm);
@@ -247,7 +252,7 @@ ggml_tensor * llm_build_noor::build_layer_delta_net(
 
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_g, n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_dim_k, head_dim_v, n_head_g, n_seqs);
 
     auto attn_out = build_delta_net(Qcur, Kcur, Vcur, gate, beta, state, il);
     ggml_tensor * output    = ggml_cont(ctx0, attn_out.first); // [head_dim, n_head_g, n_tokens, n_seqs]
@@ -265,15 +270,16 @@ ggml_tensor * llm_build_noor::build_layer_delta_net(
     // pre-tiled [head_dim, n_head_g] by the converter (the oracle's single 256-wide
     // weight, alternating low/high 128-halves across the 24 repacked heads) so this is a
     // plain elementwise multiply, no broadcast ambiguity.
-    ggml_tensor * gproj = build_lora_mm(model.layers[il].wqkv_gate, cur); // [head_dim*n_head_g, n_tokens]
-    gproj = ggml_reshape_4d(ctx0, gproj, head_dim, n_head_g, n_seq_tokens, n_seqs);
+    ggml_tensor * gproj = build_lora_mm(model.layers[il].wqkv_gate, cur); // [head_dim_v*n_head_g, n_tokens]
+    gproj = ggml_reshape_4d(ctx0, gproj, head_dim_v, n_head_g, n_seq_tokens, n_seqs);
 
     ggml_tensor * normed = ggml_rms_norm(ctx0, output, 1e-5f);
     normed = ggml_mul(ctx0, normed, model.layers[il].ssm_norm);
     ggml_tensor * gated  = ggml_mul(ctx0, normed, ggml_silu(ctx0, gproj));
     cb(gated, "o_norm_gated", il);
 
-    gated = ggml_cont_2d(ctx0, gated, head_dim * n_head_g, n_tokens);
+    gated = ggml_cont_2d(ctx0, gated, head_dim_v * n_head_g, n_tokens);
+    cb(gated, "gated_flat", il);
     cur = build_lora_mm(model.layers[il].wo, gated);
     cb(cur, "delta_net_out_proj", il);
 
