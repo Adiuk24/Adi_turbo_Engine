@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 #include <cstdio>
 
@@ -35,6 +36,7 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+    const std::string & fpath() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
