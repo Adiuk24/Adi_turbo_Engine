@@ -3,6 +3,8 @@
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
+#include "ggml.h"
+#include "ggml-moe-stream.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
@@ -1660,7 +1662,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // moe-stream: skip whole-file prefault (MAP_POPULATE/WILLNEED) so streamed
+    // expert pages are never made resident; dense pages lazy-fault on first use.
+    ml.init_mappings(!ggml_moe_stream_enabled(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1792,6 +1796,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (ggml_moe_stream_enabled()) {
+        if (ml.files.size() != 1 || !ml.use_mmap) {
+            LLAMA_LOG_WARN("%s: GGML_MOE_STREAM: unsupported configuration, streaming disabled\n", __func__);
+        } else {
+            const std::string & gguf_path = ml.files[0]->fpath();
+            int n_registered = 0;
+            // NOTE: iterate tensors_by_name (the model's own live tensors, the
+            // ones actually referenced as mul_mat_id's src[0] at inference
+            // time), not ml.weights_map (whose ->tensor is the loader's GGUF
+            // meta-context placeholder -- a different ggml_tensor* that is
+            // never touched again once load_all_data() copies its bytes into
+            // the model's tensor by name).
+            for (const auto & [name, cur] : tensors_by_name) {
+                if (name.find("_exps") == std::string::npos) {
+                    continue;
+                }
+                if (ggml_n_dims(cur) != 3 || cur->ne[2] <= 1) {
+                    continue;
+                }
+                const llama_model_loader::llama_tensor_weight * w = ml.get_weight(name.c_str());
+                if (!w || w->idx != 0) {
+                    continue;
+                }
+                if (cur->buffer && !ggml_backend_buffer_is_host(cur->buffer)) {
+                    continue; // GPU-offloaded, not eligible for CPU-side streaming
+                }
+                ggml_moe_stream_register(cur, gguf_path.c_str(), w->offs);
+                LLAMA_LOG_DEBUG("%s: GGML_MOE_STREAM: registered '%s' (%d experts)\n",
+                    __func__, name.c_str(), (int) cur->ne[2]);
+                n_registered++;
+            }
+            LLAMA_LOG_INFO("%s: GGML_MOE_STREAM: registered %d expert tensor(s) for SSD streaming\n", __func__, n_registered);
         }
     }
 

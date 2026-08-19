@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-moe-stream.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -1619,6 +1620,8 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    const bool moe_stream_registered = ggml_moe_stream_enabled() && ggml_moe_stream_is_registered(src0);
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1634,6 +1637,10 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        if (moe_stream_registered) {
+            ggml_moe_stream_plan(src0, matrix_row_counts, n_as);
+        }
     }
 
     // reset current_chunk
@@ -1644,6 +1651,22 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // a single call can route to more distinct experts than the slot pool
+    // holds (multi-token prompt-eval ubatch, warmup); ggml_moe_stream_plan()
+    // detects that and refuses to plan at all rather than corrupt the pool,
+    // so this whole call falls back to direct access for every expert
+    const bool moe_stream_active = moe_stream_registered && !ggml_moe_stream_call_overflowed(src0);
+
+    if (moe_stream_active) {
+        // parallel pread fan-out: each thread fetches a disjoint slice of the
+        // misses planned above, then all threads sync before touching slabs
+        const int n_misses = ggml_moe_stream_n_misses(src0);
+        for (int j = ith; j < n_misses; j += nth) {
+            ggml_moe_stream_fetch(src0, j);
+        }
+        ggml_barrier(params->threadpool);
+    }
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1651,7 +1674,11 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        // streamed tensors never touch src0->data (the mmap'd pages of
+        // unfetched experts must stay untouched -- that is the memory win)
+        const char * src0_cur = moe_stream_active
+            ? ggml_moe_stream_slab(src0, (int) cur_a)
+            : (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
