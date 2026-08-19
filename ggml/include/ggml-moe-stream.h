@@ -1,12 +1,21 @@
 #pragma once
 
-// moe-stream: universal SSD expert-streaming for MoE models (Phase 1).
+// moe-stream: universal SSD expert-streaming for MoE models.
 //
 // Slot-pool expert streamer for the CPU backend. When enabled (GGML_MOE_STREAM=1),
 // a fixed number of expert "slots" per MoE weight tensor are kept resident in
 // page-aligned host memory; experts are pread() from the GGUF file on demand and
 // evicted LFU-with-recency-tiebreak. The mmap'd pages backing the tensor's
 // mapped experts are never touched on the streamed path -- that is the memory win.
+//
+// A single mul_mat_id call can route to more distinct experts than the slot
+// pool holds (a multi-token prefill ubatch, or a warmup pass touching every
+// expert). The caller (ggml-cpu.c) handles this by splitting the call's
+// active experts into consecutive groups of at most n_slots and running
+// plan+fetch+compute once per group, with barriers between groups so a slot
+// is never reused while another thread is still computing from it. This
+// keeps every call memory-bounded to n_slots resident experts, decode or
+// prefill, warmup or not.
 //
 // Env vars (no CLI plumbing by design):
 //   GGML_MOE_STREAM=1            enable streaming
@@ -42,13 +51,14 @@ GGML_API bool ggml_moe_stream_is_registered(const struct ggml_tensor * t);
 // call never collide), and bumps LFU/recency bookkeeping.
 GGML_API void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_counts, int n_expert);
 
-// True if the most recent ggml_moe_stream_plan() call needed more distinct
-// experts than the slot pool holds (e.g. a multi-token prompt-eval ubatch, or
-// a warmup pass, touching more experts at once than GGML_MOE_STREAM_SLOTS
-// provides). When true, the call was NOT planned at all -- the caller must
-// fall back to direct (mmap) access for every expert this round; steady-state
-// single-token decode never hits this as long as SLOTS >= top_k.
-GGML_API bool ggml_moe_stream_call_overflowed(const struct ggml_tensor * t);
+// Slot count for this tensor (<= n_expert, see GGML_MOE_STREAM_SLOTS). Callers
+// use this to split a call's active experts into groups of at most n_slots
+// when the call needs more distinct experts than the pool holds.
+GGML_API int ggml_moe_stream_n_slots(const struct ggml_tensor * t);
+
+// Records that this call needed more than one group (stats only, call once
+// from thread 0 before the group loop starts).
+GGML_API void ggml_moe_stream_mark_chunked(const struct ggml_tensor * t);
 
 // Number of misses planned by the most recent ggml_moe_stream_plan() call.
 GGML_API int ggml_moe_stream_n_misses(const struct ggml_tensor * t);

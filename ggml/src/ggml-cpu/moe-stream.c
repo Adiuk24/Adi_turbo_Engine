@@ -57,18 +57,15 @@ struct moe_stream_entry {
     int    n_misses;
     bool * active_this_call; // [n_expert] -- protects slots this call still
                               // needs from being evicted by a later miss in
-                              // the SAME plan() call (e.g. a multi-token
-                              // prompt-eval ubatch routing many experts at once)
-    bool   call_overflow;    // true if this call needs more distinct experts
-                              // than n_slots provides -- cannot be streamed at
-                              // all this round, caller must fall back to
-                              // direct (mmap) access for every expert
+                              // the SAME plan() call (a group's experts, or --
+                              // pre-chunking -- a whole call's experts)
 
     pthread_mutex_t lock;
 
     // stats
     uint64_t          stat_hits;
     uint64_t          stat_misses;
+    uint64_t          stat_chunked_calls;
     _Atomic uint64_t stat_bytes_read;
 };
 
@@ -145,11 +142,12 @@ static int moe_stream_find_or_open_fd(const char * path) {
 static void moe_stream_atexit(void) {
     for (int i = 0; i < g_n_entries; i++) {
         struct moe_stream_entry * e = &g_entries[i];
-        fprintf(stderr, "[moe-stream] tensor=%s slots=%d hits=%llu misses=%llu bytes_read=%llu\n",
+        fprintf(stderr, "[moe-stream] tensor=%s slots=%d hits=%llu misses=%llu bytes_read=%llu chunked_calls=%llu\n",
                 e->name, e->n_slots,
                 (unsigned long long) e->stat_hits,
                 (unsigned long long) e->stat_misses,
-                (unsigned long long) e->stat_bytes_read);
+                (unsigned long long) e->stat_bytes_read,
+                (unsigned long long) e->stat_chunked_calls);
     }
 }
 
@@ -158,7 +156,7 @@ static void moe_stream_atexit(void) {
 // (ggml_moe_stream_register is only ever called from llama_model::load_tensors,
 // before any compute thread exists), so g_entries/g_n_entries are read-only
 // for the rest of the process's life. This runs on the hot path -- it is
-// called from is_registered/plan/n_misses/call_overflowed/fetch/slab on every
+// called from is_registered/plan/n_slots/n_misses/fetch/slab on every
 // thread for every mul_mat_id call -- so it must not pay for a lock that
 // protects a mutation window which is already over by the time inference starts.
 static struct moe_stream_entry * moe_stream_find_entry(const struct ggml_tensor * t) {
@@ -282,7 +280,10 @@ static int moe_stream_pick_victim(struct moe_stream_entry * e) {
             best = s;
         }
     }
-    return best; // -1 only if every slot is pinned by this call -- see call_overflow
+    // never -1: at most n_slots-1 OTHER slots can be pinned by the time a
+    // miss needs one (this plan() call has at most n_slots active experts,
+    // by the caller's group-size contract), so a non-pinned slot always exists.
+    return best;
 }
 
 void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_counts, int n_expert) {
@@ -298,26 +299,12 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
 
     const int n = n_expert < e->n_expert ? n_expert : e->n_expert;
 
-    // A single mul_mat_id call (e.g. a multi-token prompt-eval ubatch, or
-    // this fork's warmup pass) can legitimately route to more distinct
-    // experts than the slot pool holds. That call cannot be streamed at all
-    // -- fall back to direct (mmap) access for every expert this round
-    // rather than corrupt the pool by evicting an expert this same call
-    // still needs. Steady-state single-token decode (n_active <= top_k)
-    // never hits this as long as GGML_MOE_STREAM_SLOTS >= top_k.
-    int n_active = 0;
-    for (int i = 0; i < n; i++) {
-        if (row_counts[i] > 0) {
-            n_active++;
-        }
-    }
-    if (n_active > e->n_slots) {
-        e->call_overflow = true;
-        pthread_mutex_unlock(&e->lock);
-        return;
-    }
-    e->call_overflow = false;
-
+    // The caller (ggml-cpu.c) guarantees the number of experts with
+    // row_counts[i] > 0 never exceeds n_slots: it splits any call routing to
+    // more distinct experts than the pool holds into consecutive groups of at
+    // most n_slots and calls plan() once per group. That's what makes the
+    // active_this_call protection below sufficient -- pick_victim never needs
+    // to evict a slot this same plan() call still needs.
     memset(e->active_this_call, 0, (size_t) e->n_expert * sizeof(bool));
     for (int i = 0; i < n; i++) {
         e->active_this_call[i] = row_counts[i] > 0;
@@ -358,9 +345,19 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
     pthread_mutex_unlock(&e->lock);
 }
 
-bool ggml_moe_stream_call_overflowed(const struct ggml_tensor * t) {
+int ggml_moe_stream_n_slots(const struct ggml_tensor * t) {
     struct moe_stream_entry * e = moe_stream_find_entry(t);
-    return e ? e->call_overflow : false;
+    return e ? e->n_slots : 0;
+}
+
+void ggml_moe_stream_mark_chunked(const struct ggml_tensor * t) {
+    struct moe_stream_entry * e = moe_stream_find_entry(t);
+    if (!e) {
+        return;
+    }
+    pthread_mutex_lock(&e->lock);
+    e->stat_chunked_calls++;
+    pthread_mutex_unlock(&e->lock);
 }
 
 int ggml_moe_stream_n_misses(const struct ggml_tensor * t) {

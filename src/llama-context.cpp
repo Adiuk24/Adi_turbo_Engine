@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "ggml-moe-stream.h"
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -160,7 +161,15 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    cparams.op_offload = params.op_offload;
+    // moe-stream: op_offload lets the scheduler run host-resident tensor ops
+    // on a GPU backend directly against unified/mapped memory, bypassing our
+    // CPU-only mul_mat_id hook entirely (Metal would fault the streamed
+    // experts' mmap pages in on its own, defeating the whole point). Force it
+    // off whenever streaming is active, regardless of what was requested.
+    cparams.op_offload = params.op_offload && !ggml_moe_stream_enabled();
+    if (params.op_offload && !cparams.op_offload) {
+        LLAMA_LOG_WARN("%s: GGML_MOE_STREAM: forcing op_offload=false (device compute would bypass CPU streaming)\n", __func__);
+    }
     cparams.kv_unified = params.kv_unified;
     cparams.turbo_kv = params.turbo_kv;
     cparams.turbo_kv_qjl = params.turbo_kv_qjl;
