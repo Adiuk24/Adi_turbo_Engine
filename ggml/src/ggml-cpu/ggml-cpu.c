@@ -1532,6 +1532,75 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// Work-steals all chunks of one expert's (cur_a) rows across the threadpool.
+// Shared by the direct-mmap path and the moe-stream path (a streamed call
+// invokes this once per expert, once per group it belongs to).
+static void ggml_compute_forward_mul_mat_id_expert(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        const struct ggml_tensor * ids,
+        int64_t cur_a,
+        int64_t cne1,
+        const char * src0_cur,
+        const struct mmid_row_mapping * matrix_rows,
+        size_t row_size,
+        bool src1_cont,
+        const void * wdata,
+        char (*atomic_current_chunk)[CACHE_LINE_SIZE],
+        int ith,
+        int nth) {
+
+    const int64_t nr0 = src0->ne[1];
+    const int64_t nr1 = cne1;
+
+    int chunk_size = 16;
+    if (nr0 == 1 || nr1 == 1) {
+        chunk_size = 64;
+    }
+
+    // disable for NUMA
+    const bool disable_chunking = ggml_is_numa();
+
+    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+    if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+        nchunk0 = nr0 > nr1 ? nth : 1;
+        nchunk1 = nr0 > nr1 ? 1 : nth;
+    }
+
+    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+    int current_chunk = ith;
+
+    atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+
+    while (current_chunk < nchunk0 * nchunk1) {
+        const int64_t ith0 = current_chunk % nchunk0;
+        const int64_t ith1 = current_chunk / nchunk0;
+
+        const int64_t ir0_start = dr0 * ith0;
+        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+
+        const int64_t ir1_start = dr1 * ith1;
+        const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+
+        ggml_compute_forward_mul_mat_id_one_chunk(
+            dst, src0, src1, ids, cur_a,
+            ir0_start, ir0_end, ir1_start, ir1_end,
+            src0_cur, matrix_rows, row_size, src1_cont, wdata
+        );
+
+        if (nth >= nchunk0 * nchunk1) {
+            break;
+        }
+
+        current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1620,7 +1689,7 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
-    const bool moe_stream_registered = ggml_moe_stream_enabled() && ggml_moe_stream_is_registered(src0);
+    const bool moe_stream_active = ggml_moe_stream_enabled() && ggml_moe_stream_is_registered(src0);
 
     if (ith == 0) {
         // initialize matrix_row_counts
@@ -1637,13 +1706,10 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
-
-        if (moe_stream_registered) {
-            ggml_moe_stream_plan(src0, matrix_row_counts, n_as);
-        }
     }
 
-    // reset current_chunk
+    // reset current_chunk (every expert lands in exactly one group below, so
+    // one reset up front for the whole [0, n_as) range covers all of them)
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
         *current_chunk_ctr = nth;
@@ -1651,13 +1717,70 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-    // a single call can route to more distinct experts than the slot pool
-    // holds (multi-token prompt-eval ubatch, warmup); ggml_moe_stream_plan()
-    // detects that and refuses to plan at all rather than corrupt the pool,
-    // so this whole call falls back to direct access for every expert
-    const bool moe_stream_active = moe_stream_registered && !ggml_moe_stream_call_overflowed(src0);
+    if (!moe_stream_active) {
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            const int64_t cne1 = matrix_row_counts[cur_a];
 
-    if (moe_stream_active) {
+            if (cne1 == 0) {
+                continue;
+            }
+
+            const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+            const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+            ggml_compute_forward_mul_mat_id_expert(
+                dst, src0, src1, ids, cur_a, cne1, src0_cur,
+                matrix_rows, row_size, src1_cont, wdata,
+                atomic_current_chunk, ith, nth);
+        }
+        return;
+    }
+
+    // A single call can route to more distinct experts than the slot pool
+    // holds (a multi-token prefill ubatch, or a warmup pass touching every
+    // expert). Split the call's active experts into consecutive groups of at
+    // most n_slots and run plan+fetch+compute once per group: a slot freed by
+    // one group's compute is safe to reuse in the next because of the
+    // barriers between groups. n_active <= n_slots always gives exactly one
+    // group -- same plan/fetch/compute sequence as if chunking didn't exist,
+    // zero extra barriers on the decode fast path.
+    const int n_slots = ggml_moe_stream_n_slots(src0);
+
+    int active[n_as > 0 ? n_as : 1];
+    int n_active = 0;
+    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        if (matrix_row_counts[cur_a] > 0) {
+            active[n_active++] = cur_a;
+        }
+    }
+
+    const int n_groups = (n_active + n_slots - 1) / n_slots; // 0 iff n_active == 0
+
+    if (ith == 0 && n_groups > 1) {
+        ggml_moe_stream_mark_chunked(src0);
+    }
+
+    for (int g = 0; g < n_groups; ++g) {
+        const int g_start = g * n_slots;
+        const int g_end   = MIN(g_start + n_slots, n_active);
+
+        if (ith == 0) {
+            if (n_groups == 1) {
+                ggml_moe_stream_plan(src0, matrix_row_counts, n_as);
+            } else {
+                // scope row_counts to just this group's experts so plan()
+                // only reserves slots for them
+                int64_t group_row_counts[n_as > 0 ? n_as : 1];
+                memset(group_row_counts, 0, n_as * sizeof(int64_t));
+                for (int k = g_start; k < g_end; ++k) {
+                    group_row_counts[active[k]] = matrix_row_counts[active[k]];
+                }
+                ggml_moe_stream_plan(src0, group_row_counts, n_as);
+            }
+        }
+        ggml_barrier(params->threadpool);
+
         // parallel pread fan-out: each thread fetches a disjoint slice of the
         // misses planned above, then all threads sync before touching slabs
         const int n_misses = ggml_moe_stream_n_misses(src0);
@@ -1665,70 +1788,26 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_moe_stream_fetch(src0, j);
         }
         ggml_barrier(params->threadpool);
-    }
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-        const int64_t cne1 = matrix_row_counts[cur_a];
+        for (int k = g_start; k < g_end; ++k) {
+            const int cur_a = active[k];
+            const int64_t cne1 = matrix_row_counts[cur_a];
 
-        if (cne1 == 0) {
-            continue;
+            // streamed tensors never touch src0->data (the mmap'd pages of
+            // unfetched experts must stay untouched -- that is the memory win)
+            const char * src0_cur = ggml_moe_stream_slab(src0, cur_a);
+            const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+            ggml_compute_forward_mul_mat_id_expert(
+                dst, src0, src1, ids, cur_a, cne1, src0_cur,
+                matrix_rows, row_size, src1_cont, wdata,
+                atomic_current_chunk, ith, nth);
         }
 
-        // streamed tensors never touch src0->data (the mmap'd pages of
-        // unfetched experts must stay untouched -- that is the memory win)
-        const char * src0_cur = moe_stream_active
-            ? ggml_moe_stream_slab(src0, (int) cur_a)
-            : (const char *) src0->data + cur_a * nb02;
-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-        const int64_t nr0 = ne01;
-        const int64_t nr1 = cne1;
-
-        int chunk_size = 16;
-        if (nr0 == 1 || nr1 == 1) {
-            chunk_size = 64;
-        }
-
-        // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
-
-        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nth : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nth;
-        }
-
-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-
-        int current_chunk = ith;
-
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-
-        while (current_chunk < nchunk0 * nchunk1) {
-            const int64_t ith0 = current_chunk % nchunk0;
-            const int64_t ith1 = current_chunk / nchunk0;
-
-            const int64_t ir0_start = dr0 * ith0;
-            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
-
-            const int64_t ir1_start = dr1 * ith1;
-            const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
-
-            ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
-                ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
-            );
-
-            if (nth >= nchunk0 * nchunk1) {
-                break;
-            }
-
-            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        // no slot may be refilled while any thread still computes from it
+        if (g + 1 < n_groups) {
+            ggml_barrier(params->threadpool);
         }
     }
 }
