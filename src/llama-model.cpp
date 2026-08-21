@@ -2670,7 +2670,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    // moe-stream: ARM repack copies expert weights to heap AND bypasses the
+    // streaming hook — force plain buffers when streaming (same as op_offload).
+    const bool use_extra_bufts = params.use_extra_bufts && !ggml_moe_stream_enabled();
+    if (params.use_extra_bufts && !use_extra_bufts) {
+        LLAMA_LOG_WARN("%s: GGML_MOE_STREAM: forcing repack off (extra buffer types bypass CPU streaming)\n", __func__);
+    }
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, use_extra_bufts, params.no_host);
     for (auto * dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
