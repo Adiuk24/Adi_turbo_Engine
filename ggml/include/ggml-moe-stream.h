@@ -20,7 +20,13 @@
 // Env vars (no CLI plumbing by design):
 //   GGML_MOE_STREAM=1            enable streaming
 //   GGML_MOE_STREAM_SLOTS=<n>    slots per tensor (default 16, clamped to n_expert)
-//   GGML_MOE_STREAM_STATS=1      print one hits/misses/bytes_read line per tensor at exit
+//   GGML_MOE_STREAM_STATS=1      print one hits/misses/bytes_read line per tensor at exit,
+//                                 plus an aggregate fetch-latency table (count/mean/p50/p99 us)
+//   GGML_MOE_STREAM_PARALLEL=<n> fetch misses for one plan() group via a fixed pool of n
+//                                 ephemeral threads, decoupled from the ggml compute
+//                                 threadpool's nth (default 0 = old behavior: each of the
+//                                 nth compute threads fetches a disjoint slice itself, so
+//                                 concurrency is capped at nth even when nth < misses).
 
 #include "ggml.h"
 
@@ -73,6 +79,17 @@ GGML_API void ggml_moe_stream_fetch(const struct ggml_tensor * t, int miss_idx);
 // fetch phase (and its barrier) for the current plan; aborts if the expert is
 // not resident.
 GGML_API const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int expert_id);
+
+// Cached getenv("GGML_MOE_STREAM_PARALLEL"), clamped to >= 0. 0 means disabled --
+// callers should keep using the old per-compute-thread fetch fan-out.
+GGML_API int ggml_moe_stream_parallel_n(void);
+
+// Fetches all n_misses (of the most recent plan()) using a fixed pool of
+// min(ggml_moe_stream_parallel_n(), n_misses) ephemeral pthreads, one slice
+// each, joined before returning. Call from a single thread only (e.g. ith==0)
+// -- it already fans out internally, so callers must NOT also loop over
+// compute threads the way the GGML_MOE_STREAM_PARALLEL=0 path does.
+GGML_API void ggml_moe_stream_fetch_all(const struct ggml_tensor * t, int n_misses);
 
 #ifdef __cplusplus
 }

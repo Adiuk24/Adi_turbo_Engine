@@ -1778,11 +1778,23 @@ static void ggml_compute_forward_mul_mat_id(
         }
         ggml_barrier(params->threadpool);
 
-        // parallel pread fan-out: each thread fetches a disjoint slice of the
-        // misses planned above, then all threads sync before touching slabs
+        // Fetch the misses planned above. Two modes, selected by
+        // GGML_MOE_STREAM_PARALLEL (see ggml-moe-stream.h):
+        //  - default (0): each of the nth compute threads fetches a disjoint
+        //    slice itself -- concurrency is capped at nth, whatever the
+        //    ggml threadpool size happens to be.
+        //  - N>0: thread 0 alone calls fetch_all(), which fans the misses out
+        //    over a dedicated N-thread pool -- lets fetch concurrency exceed
+        //    nth (e.g. a small-vCPU VM) without changing compute parallelism.
         const int n_misses = ggml_moe_stream_n_misses(src0);
-        for (int j = ith; j < n_misses; j += nth) {
-            ggml_moe_stream_fetch(src0, j);
+        if (ggml_moe_stream_parallel_n() > 0) {
+            if (ith == 0) {
+                ggml_moe_stream_fetch_all(src0, n_misses);
+            }
+        } else {
+            for (int j = ith; j < n_misses; j += nth) {
+                ggml_moe_stream_fetch(src0, j);
+            }
         }
         ggml_barrier(params->threadpool);
 
