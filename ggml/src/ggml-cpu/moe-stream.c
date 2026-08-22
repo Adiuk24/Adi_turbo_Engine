@@ -19,10 +19,54 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MOE_STREAM_MAX_TENSORS 512
 #define MOE_STREAM_ALIGN       (2 * 1024 * 1024) // 2 MiB, per harvested reference designs
+
+// GGML_MOE_STREAM_STATS=1 latency sampling (Step 1 diagnosis instrumentation).
+// One sample = one ggml_moe_stream_fetch() call, i.e. one expert slab pulled
+// off disk (usually exactly one pread(), occasionally more on a short read).
+// Fixed-size lock-free ring via atomic fetch-add index: samples past the cap
+// are dropped (counted, not stored) rather than reallocating on the hot path.
+#define MOE_STREAM_MAX_LAT_SAMPLES (1 << 18) // 262144 * 4B = 1 MiB, plenty for a CLI run
+static _Atomic uint32_t g_lat_us[MOE_STREAM_MAX_LAT_SAMPLES]; // microseconds per fetch
+static _Atomic uint64_t g_lat_count;   // total fetch() calls (may exceed array cap)
+static _Atomic uint64_t g_lat_sum_us;  // sum of ALL samples (even dropped ones)
+
+static int moe_stream_cmp_u32(const void * a, const void * b) {
+    uint32_t va = *(const uint32_t *) a, vb = *(const uint32_t *) b;
+    return (va > vb) - (va < vb);
+}
+
+// Prints the aggregate pread-latency table across all tensors. Called once
+// from moe_stream_atexit, guarded by moe_stream_stats_enabled().
+static void moe_stream_print_lat_stats(void) {
+    uint64_t count = atomic_load_explicit(&g_lat_count, memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    uint64_t sum_us   = atomic_load_explicit(&g_lat_sum_us, memory_order_relaxed);
+    uint64_t stored   = count < MOE_STREAM_MAX_LAT_SAMPLES ? count : MOE_STREAM_MAX_LAT_SAMPLES;
+    uint32_t * copy = malloc(stored * sizeof(uint32_t));
+    if (!copy) {
+        fprintf(stderr, "[moe-stream] STATS fetch_count=%llu mean_us=%.1f (percentiles skipped: OOM)\n",
+                (unsigned long long) count, (double) sum_us / (double) count);
+        return;
+    }
+    for (uint64_t i = 0; i < stored; i++) {
+        copy[i] = atomic_load_explicit(&g_lat_us[i], memory_order_relaxed);
+    }
+    qsort(copy, stored, sizeof(uint32_t), moe_stream_cmp_u32);
+    uint32_t p50 = copy[(size_t) (stored * 50 / 100)];
+    uint32_t p99 = copy[(size_t) (stored * 99 / 100 < stored ? stored * 99 / 100 : stored - 1)];
+    fprintf(stderr,
+            "[moe-stream] STATS fetch_count=%llu mean_us=%.1f p50_us=%u p99_us=%u (sampled %llu of %llu)\n",
+            (unsigned long long) count, (double) sum_us / (double) count, p50, p99,
+            (unsigned long long) stored, (unsigned long long) count);
+    free(copy);
+}
 
 struct moe_slot {
     int      expert_id; // -1 = empty
@@ -149,6 +193,7 @@ static void moe_stream_atexit(void) {
                 (unsigned long long) e->stat_bytes_read,
                 (unsigned long long) e->stat_chunked_calls);
     }
+    moe_stream_print_lat_stats();
 }
 
 // find_entry does a bounded linear scan (<=512), lock-free. No hash map: the
@@ -377,6 +422,12 @@ void ggml_moe_stream_fetch(const struct ggml_tensor * t, int miss_idx) {
     char       * dst       = (char *) e->slots[slot].data;
     const size_t to_read   = e->slab_bytes;
 
+    const bool stats = moe_stream_stats_enabled();
+    struct timespec t0;
+    if (stats) {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+    }
+
     size_t done = 0;
     while (done < to_read) {
         ssize_t r = pread(e->fd, dst + done, to_read - done, (off_t) (off + done));
@@ -397,6 +448,23 @@ void ggml_moe_stream_fetch(const struct ggml_tensor * t, int miss_idx) {
     }
 
     atomic_fetch_add_explicit(&e->stat_bytes_read, (uint64_t) to_read, memory_order_relaxed);
+
+    if (stats) {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int64_t sec  = (int64_t) t1.tv_sec  - (int64_t) t0.tv_sec;
+        int64_t nsec = (int64_t) t1.tv_nsec - (int64_t) t0.tv_nsec;
+        if (nsec < 0) { // borrow -- tv_nsec alone can go negative across a second boundary
+            nsec += 1000000000LL;
+            sec  -= 1;
+        }
+        uint64_t us = (uint64_t) sec * 1000000ULL + (uint64_t) nsec / 1000ULL;
+        uint64_t idx = atomic_fetch_add_explicit(&g_lat_count, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_lat_sum_us, us, memory_order_relaxed);
+        if (idx < MOE_STREAM_MAX_LAT_SAMPLES) {
+            atomic_store_explicit(&g_lat_us[idx], (uint32_t) (us > UINT32_MAX ? UINT32_MAX : us), memory_order_relaxed);
+        }
+    }
 }
 
 const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int expert_id) {
@@ -407,4 +475,62 @@ const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int expert_id) {
         abort();
     }
     return (const char *) e->slots[e->expert_to_slot[expert_id]].data;
+}
+
+int ggml_moe_stream_parallel_n(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_PARALLEL");
+        int n = v ? atoi(v) : 0;
+        cached = (n > 0) ? n : 0;
+    }
+    return cached;
+}
+
+struct moe_stream_fetch_task {
+    const struct ggml_tensor * t;
+    int                        start;
+    int                        stride;
+    int                        n_misses;
+};
+
+static void * moe_stream_fetch_worker(void * arg) {
+    struct moe_stream_fetch_task * task = (struct moe_stream_fetch_task *) arg;
+    for (int j = task->start; j < task->n_misses; j += task->stride) {
+        ggml_moe_stream_fetch(task->t, j);
+    }
+    return NULL;
+}
+
+// ponytail: ephemeral spawn-join per call, not a persistent pool -- one
+// mul_mat_id group fetches at most n_slots (~64) experts, so thread-create
+// overhead (a few us) is noise next to a multi-ms pread, and there is no
+// pool lifecycle to manage (shutdown, model reload, multi-model processes).
+// Upgrade to a persistent worker pool with a condvar queue if profiling ever
+// shows thread-spawn cost mattering at this call frequency.
+void ggml_moe_stream_fetch_all(const struct ggml_tensor * t, int n_misses) {
+    if (n_misses <= 0) {
+        return;
+    }
+    const int requested = ggml_moe_stream_parallel_n();
+    const int n = requested < n_misses ? requested : n_misses;
+    if (n <= 1) {
+        for (int j = 0; j < n_misses; j++) {
+            ggml_moe_stream_fetch(t, j);
+        }
+        return;
+    }
+
+    pthread_t threads[n];
+    struct moe_stream_fetch_task tasks[n];
+    for (int i = 0; i < n; i++) {
+        tasks[i].t        = t;
+        tasks[i].start    = i;
+        tasks[i].stride   = n;
+        tasks[i].n_misses = n_misses;
+        pthread_create(&threads[i], NULL, moe_stream_fetch_worker, &tasks[i]);
+    }
+    for (int i = 0; i < n; i++) {
+        pthread_join(threads[i], NULL);
+    }
 }
