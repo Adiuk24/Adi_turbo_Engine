@@ -81,3 +81,101 @@ Verdict: do not build the prefetcher on this signal as-is. If revisited,
 the Bangla-vs-Latin split above is the first thing to chase — a
 signal-selection or per-workload table might close some of the gap that a
 single static table can't.
+
+## Generalization test (2026-08-23): does this hold on other MoE architectures?
+
+Same instrumentation (`GGML_MOE_STREAM_TRACE`), same methodology (LOO
+held-out over 7 mixed prompts: EN question, Bangla, code, arithmetic,
+dialogue, factual, list), applied to two more models to test whether
+predictability depends on expert granularity.
+
+### Qwen3-Next-80B-A3B-Instruct-Q4_K_M
+
+Config (from GGUF metadata): `qwen3next` arch, 48 layers, **512 experts/layer,
+top-10**, plus a shared expert (`expert_shared_feed_forward_length=512`).
+CPU-only via `GGML_MOE_STREAM=1 GGML_MOE_STREAM_SLOTS=64`, `-ngl 0`, on
+branch `moe-route-trace` (instrumentation already present, no port needed —
+same engine, different GGUF). ~1.5 tok/s decode; 35 decode steps/prompt.
+
+Entropy 7.58 bits/layer-token, mean **361/512 experts active per layer
+(70%)** — even more diffuse than Qwen3-30B in absolute expert count, similar
+in fraction-of-total.
+
+| split | method | recall@10 | recall@20 | recall@40 |
+|---|---|---|---|---|
+| train-on-test (biased) | baseline | 0.200 | 0.310 | 0.457 |
+| train-on-test (biased) | prev-layer | 0.542 | 0.740 | 0.899 |
+| **LOO, 7 folds** | **baseline** | **0.073** | **0.127** | **0.201** |
+| **LOO, 7 folds** | **prev-layer** | **0.187** | **0.280** | **0.387** |
+| LOO, 7 folds | prev-token | 0.174 | 0.254 | 0.355 |
+
+Held-out recall is markedly *worse* than Qwen3-30B's (recall@2k: 0.28 vs
+0.55-0.59; recall@4k: 0.39 vs 0.70-0.74) despite prev-layer still beating
+baseline by ~2x at every N — same qualitative signal, weaker in absolute
+terms. Bangla anomaly did **not** reproduce here: prev-layer beat prev-token
+on every single fold, including Bangla (@20: prev-layer=0.234 vs
+prev-token=0.229), unlike Qwen3-30B where Bangla flipped the ranking.
+
+**Verdict: further below the bar than Qwen3-30B.** More experts (512 vs
+128), same top-k regime, more diffuse routing, less predictable.
+
+### Noor-edge-v2-f16 (Bangla-native, GDN-hybrid MoE)
+
+Full detail + config + build notes: `llama-cpp-turboquant` repo, branch
+`moe-route-trace-noor` (cherry-picked the 3 trace-instrumentation commits
+from this branch onto `noor-arch`; required one small filter fix — Noor has
+no `ffn_gate_exps` tensor, MoE FFN is up/down only, no gate — see that
+branch's commit log). Config: **8 experts/layer, top-2**, plus a shared
+expert, 24 layers, tiny (2.7GB f16).
+
+Entropy only 2.28 bits/layer-token, mean **7.7/8 experts active per layer
+(96%)** — with only 8 total experts almost everything gets touched anyway.
+
+| split (LOO, 7 folds) | method | recall@2 | recall@4 | recall@8 |
+|---|---|---|---|---|
+| baseline | | 0.527 | 0.834 | 0.999 |
+| prev-layer | | 0.666 | 0.875 | 0.996 |
+| prev-token | | 0.698 | 0.873 | 0.997 |
+
+Caveat: 3 of 7 prompts (en_q, code, factual — raw completion mode, no chat
+template) collapsed into a degenerate repeated-token loop (Noor is
+Bangla-first; English/code raw completion is weak and falls into an
+attractor state even with `--repeat-penalty 1.3`). Those folds trivially
+inflate recall (same token repeated -> same experts repeated) and are not
+clean signal. The 4 clean folds (bangla, arith, dialogue, list) are the
+trustworthy ones; Bangla anomaly **partially reproduces** there: prev-token
+beats prev-layer on bangla (0.416 vs 0.376 @2) and dialogue (0.455 vs 0.385
+@2), same direction as Qwen3-30B, though the margin is smaller and doesn't
+hold at every N.
+
+recall@8 = ~0.996-0.999 is **not a real win** — with only 8 total experts,
+@8 means "predict the entire expert set," which is vacuous. The honest
+metric is @4 (2x top-k): 0.834-0.875, close to the ~85% bar, but baseline
+alone already gets 0.834 — the apparent "predictability" is mostly a
+small-total-space ceiling effect, not strong structural signal. And
+practically moot: the whole model is 2.7GB and already fits trivially in
+RAM, so there is no I/O to hide — prefetch-by-prediction has no target here.
+
+## Cross-model comparison
+
+| Model | n_experts | top_k | shared exp | layers | experts active/layer | entropy (bits) | baseline recall@k/2k/4k (LOO) | prev-layer recall@k/2k/4k (LOO) |
+|---|---|---|---|---|---|---|---|---|
+| Noor-edge-v2 | 8 | 2 | yes | 24 | 7.7 (96%) | 2.28 | 0.527 / 0.834 / 0.999 | 0.666 / 0.875 / 0.996 |
+| Qwen3-30B-A3B | 128 | 8 | no | 48 | ~97-120 (76-94%) | ~6-7 | 0.18 / 0.30 / 0.48 | 0.37 / 0.55 / 0.70 |
+| Qwen3-Next-80B-A3B | 512 | 10 | yes | 48 | 361 (70%) | 7.58 | 0.073 / 0.127 / 0.201 | 0.187 / 0.280 / 0.387 |
+
+**Predictability correlates with expert granularity, monotonically, in the
+expected direction: fewer total experts -> higher recall.** Going from 128
+to 512 experts (Qwen3 family, same top-k order of magnitude) roughly halves
+held-out prev-layer recall@2k/4k. Going down to 8 experts (Noor) pushes
+recall@4k near-ceiling — but that's substantially a small-total-space
+artifact (baseline is already near-ceiling too), not proof of strong
+cross-layer structure, and the model is too small to need prefetching in the
+first place.
+
+**Overall verdict across all 3 models: prefetch-by-prediction does not clear
+the bar anywhere it would matter.** It's unnecessary where the numbers look
+best (Noor — too small to need it) and insufficient where it would actually
+save I/O (Qwen3-30B, Qwen3-Next-80B — both diffuse, both well below 80%
+held-out recall@2k-4k, and Next is worse than 30B, not better). Do not build
+the prefetcher on this signal for any tested model class.
