@@ -81,3 +81,53 @@ Verdict: do not build the prefetcher on this signal as-is. If revisited,
 the Bangla-vs-Latin split above is the first thing to chase — a
 signal-selection or per-workload table might close some of the gap that a
 single static table can't.
+
+## Noor-edge-v2-f16 generalization run (2026-08-23, this repo/branch)
+
+Cherry-picked the 3 trace commits from `llama-cpp-moestream:moe-route-trace`
+onto `noor-arch` (clean, no conflicts, ~15 min). One fix needed: Noor's MoE
+FFN has no `ffn_gate_exps` tensor (up/down only, no gate projection) — the
+trace hook's name filter was `ffn_gate_exps`-only and never fired. Added
+`ffn_up_exps` as a fallback match (see moe-stream.c, same commit range).
+
+Command: `-ot "exps=CPU" -ngl 999` (keeps the GDN op on Metal, where it
+works; forcing everything to `-ngl 0` breaks Noor's GDN CPU kernel and
+produces degenerate output — a known issue, not something this probe should
+paper over). `--repeat-penalty 1.3` did not fix it: 3 of 7 raw-completion
+prompts (en_q, code, factual) still collapsed into a repeated-token
+attractor state (Noor is Bangla-first; English/code without a chat template
+is weak). Those 3 folds are excluded from the headline read.
+
+Config: 8 experts/layer, top-2, shared expert, 24 layers, entropy 2.28
+bits/layer-token, 7.7/8 experts active per layer (96% — small space, almost
+everything gets touched regardless of prompt).
+
+| split (LOO, 7 folds, all prompts) | method | recall@2 | recall@4 | recall@8 |
+|---|---|---|---|---|
+| baseline | | 0.527 | 0.834 | 0.999 |
+| prev-layer | | 0.666 | 0.875 | 0.996 |
+| prev-token | | 0.698 | 0.873 | 0.997 |
+
+recall@8 is vacuous here (8 = total expert count, "predicting" the whole
+set). The real number is recall@4 (2x top-k): 0.83-0.88, close to the ~85%
+bar, but baseline alone is already at 0.834 — mostly a small-total-space
+ceiling effect, not strong evidence of cross-layer/cross-token structure.
+And moot in practice: the whole model is 2.7GB, already fits in RAM, there
+is no I/O latency to hide with a prefetcher.
+
+Bangla-vs-Latin anomaly (prev-token beating prev-layer, opposite of the
+usual ranking) from the Qwen3-30B run partially reproduces on the 4 clean
+folds: bangla (prev-token 0.416 vs prev-layer 0.376 @2) and dialogue
+(0.455 vs 0.385 @2) both flip the usual ranking; arith and list do not
+consistently. Weaker and less clean than the Qwen3-30B result, but the
+same-direction flip on Bangla, on a completely different architecture (GDN
+hybrid, 8 experts vs. 128), is suggestive that it's a genuine
+script/tokenization effect and not an artifact of one model family.
+
+Full cross-model table (Noor + Qwen3-30B + Qwen3-Next-80B) and final
+verdict: see `llama-cpp-moestream:moe-route-trace`,
+`ggml/src/ggml-cpu/MOE_ROUTE_TRACE_RESULTS.md`, "Cross-model comparison"
+section (same day). Short version: predictability correlates monotonically
+with expert count, in the expected direction, but no tested model clears
+the prefetch-worthiness bar in a way that matters — do not build the
+prefetcher on this signal.
