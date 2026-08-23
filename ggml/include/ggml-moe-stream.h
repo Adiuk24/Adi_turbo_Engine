@@ -91,6 +91,19 @@ GGML_API int ggml_moe_stream_parallel_n(void);
 // compute threads the way the GGML_MOE_STREAM_PARALLEL=0 path does.
 GGML_API void ggml_moe_stream_fetch_all(const struct ggml_tensor * t, int n_misses);
 
+// GGML_MOE_STREAM_TRACE=<path> expert-routing trace (predictability probe,
+// see research/runs for the analysis). Zero-cost when the env var is unset
+// (one cached getenv check). Call once per mul_mat_id invocation from thread
+// 0, after `ids` is populated, with `src0` = the expert weight tensor for
+// this projection (used only to read its name -> layer index) and `ids` =
+// the [n_expert_used, n_tokens] selected-expert-id tensor. Internally filters
+// to one call site (ffn_gate_exps) so gate/up/down don't triple-log the same
+// routing decision. Appends one CSV row per token: token_index,layer_index,
+// expert_ids (pipe-joined, top-k in router order). token_index is a running
+// per-layer counter, not a global position -- correct as long as every layer
+// sees the same sequence of ubatch sizes, which is true for a single decode.
+GGML_API void ggml_moe_stream_trace_experts(const struct ggml_tensor * src0, const struct ggml_tensor * ids);
+
 #ifdef __cplusplus
 }
 #endif

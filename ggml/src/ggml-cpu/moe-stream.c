@@ -40,6 +40,103 @@ static int moe_stream_cmp_u32(const void * a, const void * b) {
     return (va > vb) - (va < vb);
 }
 
+// GGML_MOE_STREAM_TRACE=<path> per-(token,layer) selected-expert-id logging.
+// One-shot Phase-1 instrumentation for the expert-routing predictability
+// probe: does the router pick the same experts across layers/tokens often
+// enough to prefetch? See ggml-moe-stream.h for the call contract.
+#define MOE_STREAM_TRACE_MAX_LAYERS 256
+static FILE *          g_trace_fp = NULL;
+static pthread_mutex_t g_trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t        g_trace_token_offset[MOE_STREAM_TRACE_MAX_LAYERS];
+static uint64_t        g_trace_rows = 0;
+
+static const char * moe_stream_trace_path(void) {
+    static const char * cached = NULL;
+    static int checked = 0;
+    if (!checked) {
+        cached  = getenv("GGML_MOE_STREAM_TRACE");
+        checked = 1;
+    }
+    return cached;
+}
+
+// Tags rows from this process so multiple llama-cli invocations (one per
+// prompt) can append to one shared trace file without their token_index
+// counters (which restart at 0 per process) colliding across prompts.
+static int moe_stream_trace_run_id(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_TRACE_RUN");
+        cached = v ? atoi(v) : 0;
+    }
+    return cached;
+}
+
+static void moe_stream_trace_atexit(void) {
+    if (g_trace_fp) {
+        fclose(g_trace_fp);
+        g_trace_fp = NULL;
+    }
+    fprintf(stderr, "[moe-stream-trace] wrote %llu rows\n", (unsigned long long) g_trace_rows);
+}
+
+void ggml_moe_stream_trace_experts(const struct ggml_tensor * src0, const struct ggml_tensor * ids) {
+    const char * path = moe_stream_trace_path();
+    if (!path) {
+        return;
+    }
+
+    const char * name = ggml_get_name(src0);
+    // gate/up/down mul_mat_id calls all reuse the same `ids` (one routing
+    // decision per layer per token) -- log only once, at the gate call.
+    if (!strstr(name, "ffn_gate_exps")) {
+        return;
+    }
+
+    int layer = -1;
+    sscanf(name, "blk.%d.", &layer);
+    if (layer < 0 || layer >= MOE_STREAM_TRACE_MAX_LAYERS) {
+        return;
+    }
+
+    const int     n_ids = (int) ids->ne[0];
+    const int64_t n_tok = ids->ne[1];
+
+    pthread_mutex_lock(&g_trace_lock);
+
+    if (!g_trace_fp) {
+        // Append mode: separate llama-cli invocations (one per prompt, in the
+        // Phase-1 sweep) share one trace file. Header only on first creation.
+        const bool is_new = access(path, F_OK) != 0;
+        g_trace_fp = fopen(path, "a");
+        if (!g_trace_fp) {
+            fprintf(stderr, "ggml_moe_stream_trace: failed to open '%s': %s\n", path, strerror(errno));
+            pthread_mutex_unlock(&g_trace_lock);
+            return;
+        }
+        if (is_new) {
+            fprintf(g_trace_fp, "run_id,token_index,layer_index,expert_ids\n");
+        }
+        atexit(moe_stream_trace_atexit);
+    }
+
+    const int      run_id = moe_stream_trace_run_id();
+    const uint64_t base   = g_trace_token_offset[layer];
+    char buf[512];
+    for (int64_t iid1 = 0; iid1 < n_tok; iid1++) {
+        int off = 0;
+        for (int id = 0; id < n_ids && off < (int) sizeof(buf) - 16; id++) {
+            const int32_t eid = *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+            off += snprintf(buf + off, sizeof(buf) - off, id == 0 ? "%d" : "|%d", eid);
+        }
+        fprintf(g_trace_fp, "%d,%llu,%d,%s\n", run_id, (unsigned long long) (base + (uint64_t) iid1), layer, buf);
+        g_trace_rows++;
+    }
+    g_trace_token_offset[layer] = base + (uint64_t) n_tok;
+
+    pthread_mutex_unlock(&g_trace_lock);
+}
+
 // Prints the aggregate pread-latency table across all tensors. Called once
 // from moe_stream_atexit, guarded by moe_stream_stats_enabled().
 static void moe_stream_print_lat_stats(void) {

@@ -1703,6 +1703,9 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        // Phase-1 routing trace (GGML_MOE_STREAM_TRACE=<path>), no-op unless set.
+        ggml_moe_stream_trace_experts(src0, ids);
     }
 
     // reset current_chunk (every expert lands in exactly one group below, so
