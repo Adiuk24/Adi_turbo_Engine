@@ -88,8 +88,11 @@ void ggml_moe_stream_trace_experts(const struct ggml_tensor * src0, const struct
 
     const char * name = ggml_get_name(src0);
     // gate/up/down mul_mat_id calls all reuse the same `ids` (one routing
-    // decision per layer per token) -- log only once, at the gate call.
-    if (!strstr(name, "ffn_gate_exps")) {
+    // decision per layer per token) -- log only once. Prefer the gate call
+    // (standard SwiGLU archs: Qwen3/Qwen3-Next); Noor's MoE FFN has no
+    // separate gate projection (up/down only), so fall back to the up call
+    // there -- either way this fires exactly once per layer per token.
+    if (!strstr(name, "ffn_gate_exps") && !strstr(name, "ffn_up_exps")) {
         return;
     }
 
