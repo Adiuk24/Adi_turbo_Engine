@@ -1764,6 +1764,7 @@ static void ggml_compute_forward_mul_mat_id(
     for (int g = 0; g < n_groups; ++g) {
         const int g_start = g * n_slots;
         const int g_end   = MIN(g_start + n_slots, n_active);
+        const int64_t ms_t0 = ggml_time_us();
 
         if (ith == 0) {
             if (n_groups == 1) {
@@ -1780,6 +1781,8 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
         ggml_barrier(params->threadpool);
+        // thread 0 only, at barrier boundaries -> true wall-clock phase split
+        const int64_t ms_t1 = ggml_time_us();
 
         // parallel pread fan-out: each thread fetches a disjoint slice of the
         // misses planned above, then all threads sync before touching slabs
@@ -1788,6 +1791,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_moe_stream_fetch(src0, j);
         }
         ggml_barrier(params->threadpool);
+        const int64_t ms_t2 = ggml_time_us();
 
         for (int k = g_start; k < g_end; ++k) {
             const int cur_a = active[k];
@@ -1808,6 +1812,12 @@ static void ggml_compute_forward_mul_mat_id(
         // no slot may be refilled while any thread still computes from it
         if (g + 1 < n_groups) {
             ggml_barrier(params->threadpool);
+        }
+        if (ith == 0) {
+            const int64_t ms_t3 = ggml_time_us();
+            ggml_moe_stream_prof_add(0, ms_t1 - ms_t0);   // plan
+            ggml_moe_stream_prof_add(1, ms_t2 - ms_t1);   // fetch
+            ggml_moe_stream_prof_add(2, ms_t3 - ms_t2);   // compute
         }
     }
 }

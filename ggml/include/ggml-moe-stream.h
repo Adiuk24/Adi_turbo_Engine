@@ -60,6 +60,18 @@ GGML_API int ggml_moe_stream_n_slots(const struct ggml_tensor * t);
 // from thread 0 before the group loop starts).
 GGML_API void ggml_moe_stream_mark_chunked(const struct ggml_tensor * t);
 
+// Critical-path phase profiler. GGML_MOE_STREAM_PROF=1 dumps, at exit, the
+// wall-clock split of the streamed mul_mat_id path:
+//
+//     phase 0 = plan      (choose which experts miss)
+//     phase 1 = fetch     (parallel pread fan-out, disk busy / CPU idle)
+//     phase 2 = compute   (expert GEMMs, CPU busy / disk idle)
+//
+// Only thread 0 records, and only at ggml_barrier boundaries, so these are true
+// wall-clock phase durations -- NOT a sum over the 8 workers, which would
+// overcount blocked time by ~nth and make every phase look enormous.
+GGML_API void ggml_moe_stream_prof_add(int phase, int64_t us);
+
 // Number of misses planned by the most recent ggml_moe_stream_plan() call.
 GGML_API int ggml_moe_stream_n_misses(const struct ggml_tensor * t);
 

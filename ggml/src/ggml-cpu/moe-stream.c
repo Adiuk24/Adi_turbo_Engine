@@ -139,6 +139,99 @@ static int moe_stream_find_or_open_fd(const char * path) {
     return fd;
 }
 
+// ---------------------------------------------------------------- phase profiler
+// See ggml-moe-stream.h. Written only by thread 0 at barrier boundaries, so plain
+// (non-atomic) accumulation is safe and costs nothing on the hot path.
+static int64_t g_prof_us[3];
+static int64_t g_prof_n;
+
+void ggml_moe_stream_prof_add(int phase, int64_t us) {
+    if (phase >= 0 && phase < 3) {
+        g_prof_us[phase] += us;
+        if (phase == 0) {
+            g_prof_n++;
+        }
+    }
+}
+
+static void moe_stream_dump_prof(void) {
+    const int64_t tot = g_prof_us[0] + g_prof_us[1] + g_prof_us[2];
+    if (tot <= 0) {
+        return;
+    }
+    static const char * names[3] = { "plan", "fetch (disk)", "compute (cpu)" };
+    fprintf(stderr, "[moe-stream] critical-path phases over %lld streamed mul_mat_id call(s):\n",
+            (long long) g_prof_n);
+    for (int i = 0; i < 3; i++) {
+        fprintf(stderr, "[moe-stream]   %-14s %8.2f s  %5.1f%%\n",
+                names[i], g_prof_us[i] / 1e6, 100.0 * (double) g_prof_us[i] / (double) tot);
+    }
+    fprintf(stderr, "[moe-stream]   %-14s %8.2f s\n", "TOTAL", tot / 1e6);
+}
+
+static int moe_stream_cmp_u64_desc(const void * a, const void * b) {
+    const uint64_t x = *(const uint64_t *) a, y = *(const uint64_t *) b;
+    return (x < y) - (x > y);
+}
+
+// GGML_MOE_STREAM_HIST=1 additionally dumps the routing-concentration curve:
+// the share of all expert selections captured by the top-K hottest experts.
+//
+// This is the number that decides whether STATIC PINNING is worth building. With
+// n_slots=8 of 256 experts, uniform routing predicts a 3.1% hit rate; a measured
+// rate far above that means routing is concentrated and a pinned working set of the
+// top-K experts would cut bytes-read-per-token directly. `use_count` is already
+// maintained for LFU eviction, so this costs nothing on the hot path.
+static void moe_stream_dump_hist(void) {
+    const int KS[] = { 1, 2, 4, 8, 16, 32, 64 };
+    const int NK = (int) (sizeof(KS) / sizeof(KS[0]));
+
+    // aggregate across every registered tensor: per-tensor curves are noisy,
+    // and a pinning policy has to be decided per tensor anyway, so report the
+    // mean concentration over all 129 of them.
+    double cum[7] = { 0 };
+    int    n_used = 0;
+
+    for (int i = 0; i < g_n_entries; i++) {
+        struct moe_stream_entry * e = &g_entries[i];
+        if (e->n_expert <= 0) {
+            continue;
+        }
+        uint64_t * v = malloc((size_t) e->n_expert * sizeof(uint64_t));
+        if (!v) {
+            continue;
+        }
+        uint64_t total = 0;
+        for (int j = 0; j < e->n_expert; j++) {
+            v[j] = e->use_count[j];
+            total += v[j];
+        }
+        if (total == 0) {
+            free(v);
+            continue;
+        }
+        qsort(v, (size_t) e->n_expert, sizeof(uint64_t), moe_stream_cmp_u64_desc);
+        for (int k = 0; k < NK; k++) {
+            uint64_t s = 0;
+            for (int j = 0; j < KS[k] && j < e->n_expert; j++) {
+                s += v[j];
+            }
+            cum[k] += (double) s / (double) total;
+        }
+        n_used++;
+        free(v);
+    }
+    if (n_used == 0) {
+        return;
+    }
+    fprintf(stderr, "[moe-stream] routing concentration, mean over %d tensor(s) of %d experts:\n",
+            n_used, g_n_entries ? g_entries[0].n_expert : 0);
+    for (int k = 0; k < NK; k++) {
+        fprintf(stderr, "[moe-stream]   top-%-3d captures %5.1f%% of selections\n",
+                KS[k], 100.0 * cum[k] / n_used);
+    }
+}
+
 static void moe_stream_atexit(void) {
     for (int i = 0; i < g_n_entries; i++) {
         struct moe_stream_entry * e = &g_entries[i];
@@ -148,6 +241,12 @@ static void moe_stream_atexit(void) {
                 (unsigned long long) e->stat_misses,
                 (unsigned long long) e->stat_bytes_read,
                 (unsigned long long) e->stat_chunked_calls);
+    }
+    if (getenv("GGML_MOE_STREAM_HIST")) {
+        moe_stream_dump_hist();
+    }
+    if (getenv("GGML_MOE_STREAM_PROF")) {
+        moe_stream_dump_prof();
     }
 }
 
