@@ -1371,6 +1371,19 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// moe-stream: opt-in gate for the GPU-side allocation-order fix (see the
+// guard added at the buffer_from_host_ptr call below). Defaults OFF so the
+// current (double-mapping) behaviour is unchanged unless explicitly asked
+// for -- keeps the fix A/B-able and reversible.
+static bool moe_stream_alloc_order_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_ALLOC_ORDER");
+        cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1707,7 +1720,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // moe-stream: get_mapping_range() below returns the [first,last) byte
+        // span of *this ctx's own* tensors -- but GGUF interleaves per layer
+        // (attn, exps, attn, exps, ...), so a non-expert (GPU) context's
+        // tensors run from blk.0's attn through to the output tensor, with
+        // every CPU-resident expert byte sitting in between. That makes the
+        // range ~= the whole file, so buffer_from_host_ptr() below asks the
+        // GPU to back essentially the entire model (36GB+), blowing past
+        // iogpu.wired_limit_mb even though only a few GB of non-expert
+        // tensors are actually GPU-resident. Gate this fast path off for the
+        // GPU device only when streaming: CPU keeps its cheap lazy-mmap path
+        // (that side isn't the crash, and forcing a real alloc+memcpy there
+        // would materialize the streamed experts in RAM, defeating the
+        // point of streaming). Opt-in via GGML_MOE_STREAM_ALLOC_ORDER=1 so
+        // the current behaviour (and the -ngl 0 production path) is
+        // untouched by default.
+        const bool is_cpu_dev = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool skip_range_mmap_for_gpu = ggml_moe_stream_enabled() && moe_stream_alloc_order_enabled() && !is_cpu_dev;
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !skip_range_mmap_for_gpu) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
