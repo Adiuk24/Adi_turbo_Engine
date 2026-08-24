@@ -72,6 +72,12 @@ GGML_API void ggml_moe_stream_mark_chunked(const struct ggml_tensor * t);
 // overcount blocked time by ~nth and make every phase look enormous.
 GGML_API void ggml_moe_stream_prof_add(int phase, int64_t us);
 
+// Fetch one CHUNK of a miss's slab. n_chunks>1 splits a single expert slab across
+// several callers so every compute thread keeps a read in flight for the whole
+// fetch phase -- with only ~6 misses and 8 threads the queue otherwise drains early.
+GGML_API void ggml_moe_stream_fetch_chunk(const struct ggml_tensor * t, int miss_idx,
+                                          int chunk, int n_chunks);
+
 // Number of misses planned by the most recent ggml_moe_stream_plan() call.
 GGML_API int ggml_moe_stream_n_misses(const struct ggml_tensor * t);
 

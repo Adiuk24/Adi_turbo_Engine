@@ -1787,8 +1787,21 @@ static void ggml_compute_forward_mul_mat_id(
         // parallel pread fan-out: each thread fetches a disjoint slice of the
         // misses planned above, then all threads sync before touching slabs
         const int n_misses = ggml_moe_stream_n_misses(src0);
-        for (int j = ith; j < n_misses; j += nth) {
-            ggml_moe_stream_fetch(src0, j);
+        // Split each miss's slab into chunks so all `nth` threads keep a read in
+        // flight for the whole fetch phase. With top-6 routing there are only ~6
+        // misses but 8 threads, so the SSD queue drained early: measured 900 MB/s
+        // against 1386 MB/s the device sustains at QD=6.
+        {
+            static int n_chunks = -1;
+            if (n_chunks < 0) {
+                const char * v = getenv("GGML_MOE_STREAM_CHUNKS");
+                int c = v ? atoi(v) : 1;
+                n_chunks = (c > 0) ? c : 1;
+            }
+            const int units = n_misses * n_chunks;
+            for (int u = ith; u < units; u += nth) {
+                ggml_moe_stream_fetch_chunk(src0, u / n_chunks, u % n_chunks, n_chunks);
+            }
         }
         ggml_barrier(params->threadpool);
         const int64_t ms_t2 = ggml_time_us();

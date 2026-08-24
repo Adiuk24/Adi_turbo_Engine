@@ -142,6 +142,8 @@ static int moe_stream_find_or_open_fd(const char * path) {
 // ---------------------------------------------------------------- phase profiler
 // See ggml-moe-stream.h. Written only by thread 0 at barrier boundaries, so plain
 // (non-atomic) accumulation is safe and costs nothing on the hot path.
+static _Atomic int g_inflight;
+static _Atomic int g_inflight_max;
 static int64_t g_prof_us[3];
 static int64_t g_prof_n;
 
@@ -167,6 +169,8 @@ static void moe_stream_dump_prof(void) {
                 names[i], g_prof_us[i] / 1e6, 100.0 * (double) g_prof_us[i] / (double) tot);
     }
     fprintf(stderr, "[moe-stream]   %-14s %8.2f s\n", "TOTAL", tot / 1e6);
+    fprintf(stderr, "[moe-stream]   peak in-flight reads: %d\n",
+            atomic_load_explicit(&g_inflight_max, memory_order_relaxed));
 }
 
 static int moe_stream_cmp_u64_desc(const void * a, const void * b) {
@@ -465,6 +469,10 @@ int ggml_moe_stream_n_misses(const struct ggml_tensor * t) {
 }
 
 void ggml_moe_stream_fetch(const struct ggml_tensor * t, int miss_idx) {
+    ggml_moe_stream_fetch_chunk(t, miss_idx, 0, 1);
+}
+
+void ggml_moe_stream_fetch_chunk(const struct ggml_tensor * t, int miss_idx, int chunk, int n_chunks) {
     struct moe_stream_entry * e = moe_stream_find_entry(t);
     if (!e || miss_idx < 0 || miss_idx >= e->n_misses) {
         return;
@@ -472,9 +480,43 @@ void ggml_moe_stream_fetch(const struct ggml_tensor * t, int miss_idx) {
 
     const int    slot      = e->miss_slot_idx[miss_idx];
     const int    expert_id = e->miss_expert_id[miss_idx];
-    const size_t off       = e->file_offs + (size_t) expert_id * e->slab_bytes;
+    size_t       off       = e->file_offs + (size_t) expert_id * e->slab_bytes;
     char       * dst       = (char *) e->slots[slot].data;
-    const size_t to_read   = e->slab_bytes;
+    size_t       to_read   = e->slab_bytes;
+
+    // Split one expert slab across n_chunks callers. The fetch phase has only
+    // n_misses (~6 at top-6 routing) units of work but nth (8) threads, so two
+    // threads idle immediately and the rest finish staggered -- the SSD queue
+    // drains long before the barrier. Measured: 900 MB/s achieved against 1386
+    // MB/s the device sustains at QD=6. Chunking keeps every thread issuing for
+    // the whole phase, which is what actually raises sustained queue depth.
+    if (n_chunks > 1) {
+        const size_t page  = MOE_STREAM_ALIGN;
+        // page-align the split so each pread starts on a page boundary
+        size_t per = (e->slab_bytes + n_chunks - 1) / n_chunks;
+        per = ((per + page - 1) / page) * page;
+        const size_t start = (size_t) chunk * per;
+        if (start >= e->slab_bytes) {
+            return;                       // this chunk is past the end; nothing to do
+        }
+        size_t len = e->slab_bytes - start;
+        if (len > per) {
+            len = per;
+        }
+        off     += start;
+        dst     += start;
+        to_read  = len;
+    }
+
+    atomic_fetch_add_explicit(&g_inflight, 1, memory_order_relaxed);
+    {
+        int cur = atomic_load_explicit(&g_inflight, memory_order_relaxed);
+        int mx  = atomic_load_explicit(&g_inflight_max, memory_order_relaxed);
+        while (cur > mx &&
+               !atomic_compare_exchange_weak_explicit(&g_inflight_max, &mx, cur,
+                                                      memory_order_relaxed, memory_order_relaxed)) {
+        }
+    }
 
     size_t done = 0;
     while (done < to_read) {
@@ -496,6 +538,7 @@ void ggml_moe_stream_fetch(const struct ggml_tensor * t, int miss_idx) {
     }
 
     atomic_fetch_add_explicit(&e->stat_bytes_read, (uint64_t) to_read, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&g_inflight, 1, memory_order_relaxed);
 }
 
 const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int expert_id) {
