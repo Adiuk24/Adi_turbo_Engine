@@ -154,7 +154,13 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
 
         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
         if ((uint32_t) i < hparams.dsv4_hash_layer_count) {
-            layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, flags);
+            // The hash table's k is BAKED into the tensor shape ([k, n_vocab], k=6 for
+            // V4-Flash). Use the file's width, not hparams.n_expert_used, so that
+            // --override-kv deepseek4.expert_used_count only rescopes the LEARNED
+            // routers (layers >= hash_layer_count) and hash layers stay as shipped.
+            ggml_tensor * tid2eid_meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i).str().c_str());
+            const int64_t hash_k = tid2eid_meta ? tid2eid_meta->ne[0] : n_expert_used;
+            layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {hash_k, n_vocab}, flags);
         } else {
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, flags);
         }
@@ -1276,9 +1282,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+        int64_t n_expert_used_il = hparams.n_expert_used;
         if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
+            // k is baked into the hash table's shape; must match for the weight reshapes
+            n_expert_used_il = layer.ffn_gate_tid2eid->ne[0];
         }
 
         ggml_tensor * moe_out = build_moe_ffn(cur,
@@ -1287,7 +1296,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 layer.ffn_gate_exps,
                 layer.ffn_down_exps,
                 exp_probs_b,
-                n_expert, hparams.n_expert_used,
+                n_expert, n_expert_used_il,
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
