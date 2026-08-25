@@ -49,6 +49,7 @@ struct moe_stream_entry {
     uint64_t        * use_count;     // [n_expert], LFU frequency
     int              * expert_to_slot; // [n_expert], -1 if not resident
     uint64_t           clock;
+    uint64_t           plan_calls; // for periodic LFU decay
 
     // plan state for the in-flight mul_mat_id call (single-threaded producer
     // in ggml_moe_stream_plan, read-only fan-out consumers in ...fetch)
@@ -413,6 +414,17 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         e->active_this_call[i] = row_counts[i] > 0;
     }
 
+    // Audit adoption (PR #25294's hotness decay): plain LFU never forgets, so an
+    // early-hot expert squats in a slot forever even after routing drifts with the
+    // topic. Halve all counts every 256 plan() calls (~256 decoded tokens per
+    // tensor); recency (last_use) still breaks ties.
+    e->plan_calls++;
+    if ((e->plan_calls & 255) == 0) {
+        for (int i = 0; i < e->n_expert; i++) {
+            e->use_count[i] >>= 1;
+        }
+    }
+
     for (int i = 0; i < n; i++) {
         if (row_counts[i] <= 0) {
             continue;
@@ -491,7 +503,10 @@ void ggml_moe_stream_fetch_chunk(const struct ggml_tensor * t, int miss_idx, int
     // MB/s the device sustains at QD=6. Chunking keeps every thread issuing for
     // the whole phase, which is what actually raises sustained queue depth.
     if (n_chunks > 1) {
-        const size_t page  = MOE_STREAM_ALIGN;
+        // Audit F5: this used MOE_STREAM_ALIGN (2 MiB) as the split floor, which
+        // degenerates CHUNKS=4 on a 3.58 MiB slab into 2 real chunks + 2 no-ops.
+        // The actual page is 16 KiB; align to that so requested parallelism is real.
+        const size_t page  = moe_stream_page_size();
         // page-align the split so each pread starts on a page boundary
         size_t per = (e->slab_bytes + n_chunks - 1) / n_chunks;
         per = ((per + page - 1) / page) * page;
