@@ -2837,28 +2837,66 @@ private:
             }
         }
 
-        // positions that still need a real decode: gaps around/between spans, plus repair windows
-        std::vector<int> decode_pos;
-        decode_pos.reserve(n_prompt);
+        // Build one ascending-position plan of segments. Each is either a REUSE segment
+        // (a span's tail, minus its own repair window) or a FRESH segment that needs a
+        // real decode (a gap between/around spans, or a span's repair window - which
+        // comes BEFORE that span's own reused tail in position order).
+        //
+        // llama-batch.cpp enforces strict per-sequence position continuity for standard
+        // (non-M-RoPE) models: a batch's minimum position for a sequence must equal that
+        // sequence's current pos_max + 1. We cannot hand the allocator one batch spanning
+        // positions both below and above cells already shifted into the cache, so instead
+        // we walk the plan left to right and advance the live sequence's frontier one
+        // segment at a time - REUSE segments via seq_cp/seq_rm/seq_add (raises pos_max to
+        // the segment's end, no decode), FRESH segments via decode (starts exactly at the
+        // current pos_max + 1 by construction, since segments tile [0, n_prompt) with no
+        // gaps or overlaps).
+        struct blend_segment { bool is_reuse; int start; int end; int d_start; };
+        std::vector<blend_segment> segments;
+        segments.reserve(spans.size() * 2 + 1);
+
         int cursor = 0;
         for (size_t i = 0; i < spans.size(); i++) {
-            for (int q = cursor; q < spans[i].p; q++) {
-                decode_pos.push_back(q);
+            const auto & sp = spans[i];
+
+            if (cursor < sp.p) {
+                segments.push_back({false, cursor, sp.p, 0});
             }
-            for (int q = 0; q < repair_w[i]; q++) {
-                decode_pos.push_back(spans[i].p + q);
+            if (repair_w[i] > 0) {
+                segments.push_back({false, sp.p, sp.p + repair_w[i], 0});
             }
-            cursor = spans[i].p + spans[i].len;
+
+            const int reuse_start = sp.p + repair_w[i];
+            const int reuse_end   = sp.p + sp.len;
+            if (reuse_start < reuse_end) {
+                segments.push_back({true, reuse_start, reuse_end, sp.d + repair_w[i]});
+            }
+
+            cursor = sp.p + sp.len;
         }
-        for (int q = cursor; q < n_prompt; q++) {
-            decode_pos.push_back(q);
+        if (cursor < n_prompt) {
+            segments.push_back({false, cursor, n_prompt, 0});
+        }
+
+        // the span-reaches-end repair rule above (plus the trailing gap we just added)
+        // guarantees the plan always ends on a FRESH segment - that is what carries the
+        // final prompt token through the shared batch and produces valid logits
+        if (segments.empty() || segments.back().is_reuse) {
+            SLT_ERR(slot, "%s", "blend: internal planning error, plan does not end on a fresh segment\n");
+            return false;
         }
 
         const int32_t n_batch = llama_n_batch(ctx_tgt);
-        if ((int) decode_pos.size() > n_batch) {
-            SLT_WRN(slot, "blend plan needs %d fresh tokens, exceeds n_batch = %d, falling back to full prefill\n",
-                    (int) decode_pos.size(), n_batch);
-            return false;
+        uint64_t n_recomputed = 0;
+        for (const auto & seg : segments) {
+            if (!seg.is_reuse) {
+                n_recomputed += seg.end - seg.start;
+                if (seg.end - seg.start > n_batch) {
+                    SLT_WRN(slot, "blend: fresh segment [%d, %d) exceeds n_batch = %d, falling back to full prefill\n",
+                            seg.start, seg.end, n_batch);
+                    return false;
+                }
+            }
         }
 
         // --- commit: everything above was pure planning, nothing has been mutated yet ---
@@ -2869,63 +2907,86 @@ private:
             return false;
         }
 
-        bool ok = true;
-        for (size_t i = 0; i < spans.size() && ok; i++) {
-            const auto & sp = spans[i];
-
-            llama_memory_seq_cp(mem, BLEND_DONOR_SEQ, slot.id, sp.d, sp.d + sp.len);
-
-            // detach the donor's tag while the rows are still at the donor's own position
-            // range (see the design note above) - this is what makes the shift below safe
-            if (!llama_memory_seq_rm(mem, BLEND_DONOR_SEQ, sp.d, sp.d + sp.len)) {
-                ok = false;
-                break;
-            }
-
-            llama_memory_seq_add(mem, slot.id, sp.d, sp.d + sp.len, sp.p - sp.d);
-
-            if (repair_w[i] > 0 && !llama_memory_seq_rm(mem, slot.id, sp.p, sp.p + repair_w[i])) {
-                ok = false;
-                break;
-            }
-        }
-
-        if (!ok) {
-            SLT_WRN(slot, "%s", "blend: KV assembly failed midway, resetting slot and falling back to full prefill\n");
-            llama_memory_seq_rm(mem, slot.id, -1, -1);
-            slot.prompt.clear();
-            return false;
-        }
-
-        for (const auto & sp : spans) {
-            for (int k = 0; k < sp.len; k++) {
-                blend_donor_used[sp.d + k] = true;
-            }
-        }
-
         // token identities are already known in full - no need to discover them incrementally
         slot.prompt.tokens.clear();
         for (int i = 0; i < n_prompt; i++) {
             slot.prompt.tokens.push_back(prompt[i]);
         }
 
-        bool add_ok = true;
-        for (int pos : decode_pos) {
-            add_ok &= batch.add(slot.id, prompt[pos], pos, /* output = */ false, /* is_prompt = */ true);
-        }
-
-        if (!add_ok) {
-            // should not happen, decode_pos.size() was already checked against n_batch above
-            SLT_ERR(slot, "%s", "blend: batch overflow while queuing decode positions\n");
+        const auto fail = [&](const char * why) {
+            SLT_WRN(slot, "blend: %s, resetting slot and falling back to full prefill\n", why);
             llama_memory_seq_rm(mem, slot.id, -1, -1);
             slot.prompt.clear();
             return false;
+        };
+
+        int n_staged_decodes = 0;
+
+        for (size_t i = 0; i < segments.size(); i++) {
+            const auto & seg = segments[i];
+
+            if (seg.is_reuse) {
+                const int len = seg.end - seg.start;
+
+                llama_memory_seq_cp(mem, BLEND_DONOR_SEQ, slot.id, seg.d_start, seg.d_start + len);
+
+                // detach the donor's tag while the rows are still at the donor's own
+                // position range (see the design note above) - this is what makes the
+                // shift below safe, and it never touches another span's donor range:
+                // seq_add below only ever targets the live seq, and each span claims a
+                // disjoint donor range up front (see `claimed` during span matching)
+                if (!llama_memory_seq_rm(mem, BLEND_DONOR_SEQ, seg.d_start, seg.d_start + len)) {
+                    return fail("KV assembly failed detaching a donor range");
+                }
+
+                llama_memory_seq_add(mem, slot.id, seg.d_start, seg.d_start + len, seg.start - seg.d_start);
+
+                for (int k = 0; k < len; k++) {
+                    blend_donor_used[seg.d_start + k] = true;
+                }
+
+                continue;
+            }
+
+            const bool is_last_segment = (i + 1 == segments.size());
+
+            if (!is_last_segment) {
+                // interior fresh segment: decode it locally and synchronously so the live
+                // seq's pos_max reaches seg.end before the next segment is queued
+                llama_batch local_batch = llama_batch_init(seg.end - seg.start, 0, 1);
+                common_batch_clear(local_batch);
+                for (int q = seg.start; q < seg.end; q++) {
+                    common_batch_add(local_batch, prompt[q], q, {slot.id}, false);
+                }
+                const int ret = llama_decode(ctx_tgt, local_batch);
+                llama_batch_free(local_batch);
+
+                if (ret != 0) {
+                    return fail("a staged decode call failed");
+                }
+                n_staged_decodes++;
+            } else {
+                // last fresh segment: route through the shared scheduler batch so the
+                // normal decode()/sampling machinery picks up the final token's logits
+                batch.slot_batched = &slot;
+
+                bool add_ok = true;
+                for (int q = seg.start; q < seg.end; q++) {
+                    add_ok &= batch.add(slot.id, prompt[q], q, /* output = */ false, /* is_prompt = */ true);
+                }
+
+                if (!add_ok) {
+                    // should not happen, this segment's length was already checked against n_batch above
+                    batch.clear(); // drop the half-built blend batch (also resets slot_batched)
+                    return fail("batch overflow while queuing the final segment");
+                }
+
+                batch.set_output(batch.size() - 1, true);
+                slot.i_batch = batch.size() - 1;
+            }
         }
 
-        batch.set_output(batch.size() - 1, true);
-
-        const uint64_t n_reused     = n_prompt - decode_pos.size();
-        const uint64_t n_recomputed = decode_pos.size();
+        const uint64_t n_reused = n_prompt - n_recomputed;
 
         slot.stats.n_prompt_cached          = n_reused;
         slot.stats.n_prompt_processed       = n_recomputed;
@@ -2936,12 +2997,12 @@ private:
 
         metrics.add_prompt_cached(n_reused);
 
-        SLT_INF(slot, "blend: n_prompt = %d, spans = %zu, reused = %" PRIu64 ", recomputed = %" PRIu64 ", donor_coverage = %.1f%%\n",
-                n_prompt, spans.size(), n_reused, n_recomputed, slot.stats.blend_donor_coverage_pct);
+        SLT_INF(slot, "blend: n_prompt = %d, spans = %zu, reused = %" PRIu64 ", recomputed = %" PRIu64
+                ", donor_coverage = %.1f%%, staged_decodes = %d\n",
+                n_prompt, spans.size(), n_reused, n_recomputed, slot.stats.blend_donor_coverage_pct, n_staged_decodes);
 
         slot.state       = SLOT_STATE_DONE_PROMPT;
         slot.stats.n_gen = 0;
-        slot.i_batch     = batch.size() - 1;
         slot.init_sampler();
 
         return true;
