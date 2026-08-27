@@ -1,126 +1,90 @@
-# llama.cpp
+# AdiTurbo Engine
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**Run MoE models larger than your RAM, from any disk, at usable speed.**
 
-<div align="center">
+A [llama.cpp](https://github.com/ggml-org/llama.cpp) fork with `moe-stream`:
+demand-paged expert streaming for Mixture-of-Experts models. Dense layers and
+attention run on your GPU (Metal/CUDA) or CPU; routed experts stay on disk and
+stream in per token through a cached slot pool. A 348B-parameter model runs on
+a 24 GB laptop over a USB SSD.
 
-<b>LLM inference in C/C++</b>
+Built in Dhaka, Bangladesh as the engine of the ADIOS project — a fully
+offline, self-contained AI system on a portable SSD.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+## Measured results (not projections)
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+All numbers from a 24 GB MacBook (M4 Pro) with the model on an external USB
+SSD (1.05 GB/s measured wall), temp-0, reproducible from this tree:
 
-</div>
+| model | size on disk | decode |
+|---|---|---|
+| DeepSeek-V4-Flash 348B (Q2, top-3) | 90 GB | **1.1–1.3 tok/s** |
+| gpt-oss-120B (MXFP4, top-3) | 59 GB | 1.3 tok/s |
+| Qwen3-Next-80B-A3B (Q3) | 36 GB | **4.5 tok/s** |
+| Qwen3-30B-A3B (Q3, streamed) | 14 GB | 3.4 tok/s |
 
-## Quick start
+- ~10 GB RSS while serving the 348B model (3.7× RAM overcommit).
+- Bytes/token 1.23 GB vs 1.47 GB for the comparable upstream draft (PR #25294);
+  decode-phase bus utilization 60–76%.
+- Verified on macOS/Metal, Linux/x86 CPU, Linux/CUDA (T4, L4), Android arm64.
 
-A few options to get `llama.cpp` installed on your machine:
+## Beyond streaming: agent-workload features
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+**KV persistence across restarts** (`--slot-save-path` + slot restore at boot):
+a 29k-token agent preamble goes from 234 s re-prefill to **0.4 s** after a
+server restart (0.27 s on an L4).
 
-Once installed:
+**Blend — non-prefix KV reuse** (CacheBlend-class, unique to this fork among
+GGUF runtimes as far as we know): when a prompt contains chunks of a previous
+context in a *different order or position* (reordered tool docs, shuffled RAG
+passages), their KV is transplanted and position-shifted instead of recomputed,
+with a small repair window per span. Measured: reordered 5.7k-token prompt
+**12.8 s → 1.65 s (7.8×)**, 98.7% KV reused, answer quality verified against
+planted facts. Usage: `POST /blend/adopt` to snapshot the current context as
+donor, then `"blend": true` on chat requests. Requires `--kv-unified -np 1`.
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+## Quick start (streamed giant)
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bash
+GGML_MOE_STREAM=1 GGML_MOE_STREAM_ALLOC_ORDER=1 \
+GGML_MOE_STREAM_SLOTS=16 GGML_MOE_STREAM_CHUNKS=4 \
+./build/bin/llama-server -m model.gguf \
+  -ngl 99 -cmoe -t 8 -np 1 -c 1024 -ub 256 -b 1024 \
+  --poll 0 --no-warmup --jinja --reasoning off
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Notes:
+- The GGUF must be a **single file** (`llama-gguf-split --merge` first).
+- `--override-kv <arch>.expert_used_count=int:K` is the speed/quality dial:
+  fewer experts per token = fewer bytes streamed. K=3 measured quality-safe on
+  the models above; K=2 is drafting-only.
+- Tuning knobs (all default-off, all temp-0 parity-gated; see
+  `ggml/include/ggml-moe-stream.h`): `GGML_MOE_STREAM_NOCACHE`,
+  `GGML_MOE_STREAM_EVICT=pinlru`, `GGML_MOE_STREAM_HITFIRST`,
+  `GGML_MOE_STREAM_PREFETCH` (+ `_DEPTH`, `_SLOTS`, `_MB`). On a USB-class bus
+  they are neutral (it's bandwidth-bound); they target NVMe/big-RAM tiers.
+- `GGML_MOE_STREAM_STATS=1` prints per-tensor hit/miss/bytes; a phase profiler
+  and routing histogram are built in.
 
-## Description
+## Honest limits
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+- Steady-state decode is **storage-bandwidth-bound**: tok/s ≈ bus ÷
+  bytes-per-token. Software cannot manufacture bandwidth; quantized models and
+  the k-dial reduce the numerator, hardware raises the denominator.
+- CPU-only boxes with fast NVMe become **compute-bound** (measured: 8 cores +
+  10 GB/s NVMe = 2.1 tok/s on the 80B — slower than a laptop GPU + slow USB).
+  Pair a GPU for dense/attention with NVMe for experts.
+- f16 streaming is 8.5× slower than Q3 on the same bus (measured). Stream
+  quantized.
+- Blend v1: single-slot (`-np 1 --kv-unified`), attention models only, donor
+  ranges are consume-once between adopts.
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+## Credits
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+— all upstream credit to its authors and community. The blend feature adapts
+ideas from [CacheBlend](https://arxiv.org/abs/2405.16444) /
+[LMCache](https://github.com/LMCache/LMCache) research to llama.cpp's KV
+primitives. Streaming design informed by our measurements and a teardown of
+[kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c). License: MIT,
+same as upstream.
