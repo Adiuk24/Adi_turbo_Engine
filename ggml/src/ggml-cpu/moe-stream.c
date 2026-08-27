@@ -20,10 +20,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MOE_STREAM_MAX_TENSORS 512
 #define MOE_STREAM_ALIGN       (2 * 1024 * 1024) // 2 MiB, per harvested reference designs
+
+// GGML_MOE_STREAM_PREFETCH=1: state machine for the P extra landing slots
+// reserved per tensor (see ggml-moe-stream.h). NORMAL slots (the original
+// n_slots) never carry this state -- only the P prefetch slots do.
+enum pf_state {
+    PF_FREE     = 0, // available for a new speculative claim
+    PF_INFLIGHT = 1, // claimed by plan(), pread in progress on the IO thread
+    PF_READY    = 2, // pread complete, buffer valid, awaiting promotion or supersession
+};
 
 struct moe_slot {
     int      expert_id; // -1 = empty
@@ -71,6 +81,22 @@ struct moe_stream_entry {
     uint64_t          stat_misses;
     uint64_t          stat_chunked_calls;
     _Atomic uint64_t stat_bytes_read;
+
+    // ---- prefetch (GGML_MOE_STREAM_PREFETCH=1), see ggml-moe-stream.h ----
+    int                 pf_n_slots;    // P granted to this tensor by the global RAM budget; 0 = no prefetch here
+    int               * pf_expert_id;  // [pf_n_slots], expert id claimed/held by this pf slot, -1 = none
+    _Atomic int       * pf_state;      // [pf_n_slots], enum pf_state -- IO thread release-stores PF_READY,
+                                        // plan() acquire-loads it; no lock needed (invariant 4, see plan())
+    struct moe_slot   * pf_slots;      // [pf_n_slots], landing buffers; .data is swapped into a NORMAL slot
+                                        // on promotion (two pointer writes, never a memcpy)
+    _Atomic int       * miss_chunks_done; // [n_slots], per-miss count of completed fetch_chunk() calls this
+                                           // plan() cycle -- drives the g_demand_pending bus-yield signal
+
+    uint64_t          stat_prefetch_issued;
+    uint64_t          stat_prefetch_hits;   // promotions
+    uint64_t          stat_prefetch_wasted; // superseded by a demand fetch before promotion
+    uint64_t          stat_prefetch_ring_full;
+    _Atomic uint64_t stat_prefetch_bytes;   // speculative bytes, kept separate from stat_bytes_read
 };
 
 static struct moe_stream_entry g_entries[MOE_STREAM_MAX_TENSORS];
@@ -84,6 +110,44 @@ struct moe_fd_entry {
 };
 static struct moe_fd_entry g_fds[MOE_STREAM_MAX_TENSORS];
 static int                 g_n_fds = 0;
+
+// ---- prefetch (GGML_MOE_STREAM_PREFETCH=1) ----
+
+// Global RAM budget for prefetch arenas, spent (never refunded) as tensors
+// register. Caller must hold g_registry_lock, same as everything else
+// touched during ggml_moe_stream_register.
+static size_t g_pf_budget_remaining = 0;
+static int    g_pf_budget_inited    = 0;
+static int    g_pf_tensors_granted  = 0;
+
+struct moe_prefetch_req {
+    struct moe_stream_entry * e;
+    int                       expert_id;
+    int                       pf_slot_idx; // index into e->pf_expert_id / e->pf_state / e->pf_slots
+};
+
+#define MOE_PREFETCH_RING_CAP 64
+
+// Single-producer/single-consumer ring: thread 0 inside plan() is the sole
+// producer, the one global IO thread is the sole consumer. head/tail are
+// monotonic counters, indexed mod capacity.
+static struct moe_prefetch_req g_pf_ring[MOE_PREFETCH_RING_CAP];
+static _Atomic size_t          g_pf_ring_head;
+static _Atomic size_t          g_pf_ring_tail;
+
+static pthread_t      g_pf_io_thread;
+static _Atomic int    g_pf_thread_live;
+static pthread_once_t g_pf_once = PTHREAD_ONCE_INIT;
+
+static pthread_mutex_t g_pf_io_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pf_io_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic int     g_pf_shutdown;
+
+// Incremented in plan() by the number of misses just planned, decremented in
+// fetch_chunk() when a miss's last chunk completes. The prefetch IO thread
+// polls this between its own 4 MiB sub-reads and backs off while it's > 0,
+// so speculative reads never contend the bus against demand fetches.
+static _Atomic int g_demand_pending;
 
 bool ggml_moe_stream_enabled(void) {
     static int cached = -1;
@@ -111,6 +175,55 @@ static bool moe_stream_stats_enabled(void) {
         cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
     }
     return cached != 0;
+}
+
+// GGML_MOE_STREAM_PREFETCH=1: enable the background speculative-prefetch IO
+// thread. Default off -- zero behavior change, byte-identical to before.
+static bool moe_stream_prefetch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_PREFETCH");
+        cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+// GGML_MOE_STREAM_PREFETCH_SLOTS=<n>: extra landing slots per tensor (default 4).
+static int moe_stream_prefetch_slots_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_PREFETCH_SLOTS");
+        int n = v ? atoi(v) : 4;
+        cached = (n > 0) ? n : 4;
+    }
+    return cached;
+}
+
+// GGML_MOE_STREAM_PREFETCH_DEPTH=<n>: tensors ahead (registration order) to predict for (default 2).
+static int moe_stream_prefetch_depth_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_PREFETCH_DEPTH");
+        int n = v ? atoi(v) : 2;
+        cached = (n > 0) ? n : 2;
+    }
+    return cached;
+}
+
+// GGML_MOE_STREAM_PREFETCH_MB=<n>: total prefetch arena budget across ALL
+// tensors, in MiB (default 2048). Prevents P x slab_alloc_bytes x n_tensors
+// from becoming catastrophic (e.g. 4 x 90 MB x 183 tensors).
+static size_t moe_stream_prefetch_budget_bytes(void) {
+    static long long cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_PREFETCH_MB");
+        long long mb = v ? atoll(v) : 2048;
+        if (mb <= 0) {
+            mb = 2048;
+        }
+        cached = mb * 1024 * 1024;
+    }
+    return (size_t) cached;
 }
 
 enum moe_evict_policy {
@@ -287,6 +400,29 @@ static void moe_stream_atexit(void) {
                 (unsigned long long) e->stat_bytes_read,
                 (unsigned long long) e->stat_chunked_calls,
                 pinned);
+        if (moe_stream_prefetch_enabled() && e->pf_n_slots > 0) {
+            fprintf(stderr, "[moe-stream]   prefetch: pf_slots=%d issued=%llu hits=%llu wasted=%llu ring_full=%llu bytes=%llu\n",
+                    e->pf_n_slots,
+                    (unsigned long long) e->stat_prefetch_issued,
+                    (unsigned long long) e->stat_prefetch_hits,
+                    (unsigned long long) e->stat_prefetch_wasted,
+                    (unsigned long long) e->stat_prefetch_ring_full,
+                    (unsigned long long) e->stat_prefetch_bytes);
+        }
+    }
+    if (moe_stream_prefetch_enabled()) {
+        uint64_t tot_issued = 0, tot_hits = 0, tot_wasted = 0, tot_ring_full = 0, tot_bytes = 0;
+        for (int i = 0; i < g_n_entries; i++) {
+            struct moe_stream_entry * e = &g_entries[i];
+            tot_issued    += e->stat_prefetch_issued;
+            tot_hits      += e->stat_prefetch_hits;
+            tot_wasted    += e->stat_prefetch_wasted;
+            tot_ring_full += e->stat_prefetch_ring_full;
+            tot_bytes     += e->stat_prefetch_bytes;
+        }
+        fprintf(stderr, "[moe-stream] prefetch totals: issued=%llu hits=%llu wasted=%llu ring_full=%llu bytes=%llu\n",
+                (unsigned long long) tot_issued, (unsigned long long) tot_hits, (unsigned long long) tot_wasted,
+                (unsigned long long) tot_ring_full, (unsigned long long) tot_bytes);
     }
     if (getenv("GGML_MOE_STREAM_HIST")) {
         moe_stream_dump_hist();
@@ -387,6 +523,58 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
         e->slots[s].data = mem;
     }
 
+    // prefetch: grant this tensor P extra landing slots only if the global
+    // RAM budget still has room for all of them (all-or-nothing per tensor,
+    // never partial -- see ggml-moe-stream.h). e->pf_n_slots stays 0 (fields
+    // NULL) otherwise, so every prefetch code path is a no-op for this tensor.
+    e->pf_n_slots       = 0;
+    e->pf_expert_id     = NULL;
+    e->pf_state         = NULL;
+    e->pf_slots         = NULL;
+    e->miss_chunks_done = NULL;
+
+    if (moe_stream_prefetch_enabled()) {
+        if (!g_pf_budget_inited) {
+            g_pf_budget_remaining = moe_stream_prefetch_budget_bytes();
+            g_pf_budget_inited    = 1;
+        }
+        const int    want_p     = moe_stream_prefetch_slots_env();
+        const size_t want_bytes = (size_t) want_p * e->slab_alloc_bytes;
+        if (want_bytes <= g_pf_budget_remaining) {
+            e->pf_n_slots = want_p;
+            g_pf_budget_remaining -= want_bytes;
+            g_pf_tensors_granted++;
+        }
+
+        if (e->pf_n_slots > 0) {
+            e->pf_expert_id     = malloc((size_t) e->pf_n_slots * sizeof(int));
+            e->pf_state         = malloc((size_t) e->pf_n_slots * sizeof(_Atomic int));
+            e->pf_slots         = calloc((size_t) e->pf_n_slots, sizeof(struct moe_slot));
+            e->miss_chunks_done = malloc((size_t) e->n_slots * sizeof(_Atomic int));
+            if (!e->pf_expert_id || !e->pf_state || !e->pf_slots || !e->miss_chunks_done) {
+                fprintf(stderr, "ggml_moe_stream: out of memory allocating prefetch state for tensor '%s'\n",
+                        ggml_get_name(t));
+                abort();
+            }
+            for (int p = 0; p < e->pf_n_slots; p++) {
+                e->pf_expert_id[p] = -1;
+                atomic_init(&e->pf_state[p], PF_FREE);
+                void * mem = NULL;
+                int rc = posix_memalign(&mem, MOE_STREAM_ALIGN, e->slab_alloc_bytes);
+                if (rc != 0 || !mem) {
+                    fprintf(stderr, "ggml_moe_stream: posix_memalign failed for tensor '%s' prefetch slot %d\n",
+                            ggml_get_name(t), p);
+                    abort();
+                }
+                e->pf_slots[p].data       = mem;
+                e->pf_slots[p].expert_id  = -1;
+            }
+            for (int i = 0; i < e->n_slots; i++) {
+                atomic_init(&e->miss_chunks_done[i], 0);
+            }
+        }
+    }
+
     if (moe_stream_stats_enabled() && !g_atexit_registered) {
         fprintf(stderr, "[moe-stream] eviction policy: %s\n",
                 moe_stream_evict_policy() == MOE_EVICT_PINLRU ? "pinlru" : "lfu");
@@ -451,6 +639,260 @@ static int moe_stream_pick_victim(struct moe_stream_entry * e) {
     return best != -1 ? best : fallback;
 }
 
+// ---- prefetch (GGML_MOE_STREAM_PREFETCH=1): ring, IO thread, predictor ----
+
+static bool moe_stream_pf_ring_push(const struct moe_prefetch_req * req) {
+    const size_t head = atomic_load_explicit(&g_pf_ring_head, memory_order_relaxed);
+    const size_t tail = atomic_load_explicit(&g_pf_ring_tail, memory_order_acquire);
+    if (head - tail >= MOE_PREFETCH_RING_CAP) {
+        return false; // full
+    }
+    g_pf_ring[head % MOE_PREFETCH_RING_CAP] = *req;
+    atomic_store_explicit(&g_pf_ring_head, head + 1, memory_order_release);
+    pthread_mutex_lock(&g_pf_io_lock);
+    pthread_cond_signal(&g_pf_io_cond);
+    pthread_mutex_unlock(&g_pf_io_lock);
+    return true;
+}
+
+static bool moe_stream_pf_ring_pop(struct moe_prefetch_req * out) {
+    const size_t tail = atomic_load_explicit(&g_pf_ring_tail, memory_order_relaxed);
+    const size_t head = atomic_load_explicit(&g_pf_ring_head, memory_order_acquire);
+    if (tail == head) {
+        return false; // empty
+    }
+    *out = g_pf_ring[tail % MOE_PREFETCH_RING_CAP];
+    atomic_store_explicit(&g_pf_ring_tail, tail + 1, memory_order_release);
+    return true;
+}
+
+// Runs on the IO thread only. Reads one expert's slab into its claimed pf
+// slot's buffer in 4 MiB sub-reads, backing off while a demand fetch is
+// outstanding anywhere (g_demand_pending). Never touches e->lock: the slot
+// was claimed (PF_INFLIGHT) by plan() before this request was enqueued, and
+// nothing else writes this buffer or reads it until PF_READY is visible
+// (invariant 4: state alone is the synchronization, no lock).
+static void moe_stream_pf_do_fetch(const struct moe_prefetch_req * req) {
+    struct moe_stream_entry * e         = req->e;
+    const int                 expert_id = req->expert_id;
+    const int                 p         = req->pf_slot_idx;
+
+    const size_t off     = e->file_offs + (size_t) expert_id * e->slab_bytes;
+    char       * dst      = (char *) e->pf_slots[p].data;
+    const size_t to_read  = e->slab_bytes;
+    const size_t sub      = 4 * 1024 * 1024;
+    size_t       done     = 0;
+
+    while (done < to_read) {
+        while (atomic_load_explicit(&g_demand_pending, memory_order_acquire) > 0) {
+            if (atomic_load_explicit(&g_pf_shutdown, memory_order_relaxed)) {
+                break;
+            }
+            usleep(500);
+        }
+
+        size_t chunk = to_read - done;
+        if (chunk > sub) {
+            chunk = sub;
+        }
+        size_t chunk_done = 0;
+        while (chunk_done < chunk) {
+            ssize_t r = pread(e->fd, dst + done + chunk_done, chunk - chunk_done, (off_t) (off + done + chunk_done));
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                // speculative, not on the critical path -- abandon the slot instead of
+                // abort()ing like the demand-fetch path does (ggml_moe_stream_fetch_chunk)
+                fprintf(stderr, "ggml_moe_stream: prefetch pread failed for tensor '%s' expert %d: %s (abandoning prefetch)\n",
+                        e->name, expert_id, strerror(errno));
+                e->pf_expert_id[p] = -1;
+                atomic_store_explicit(&e->pf_state[p], PF_FREE, memory_order_release);
+                return;
+            }
+            if (r == 0) {
+                fprintf(stderr, "ggml_moe_stream: prefetch EOF for tensor '%s' expert %d (abandoning prefetch)\n",
+                        e->name, expert_id);
+                e->pf_expert_id[p] = -1;
+                atomic_store_explicit(&e->pf_state[p], PF_FREE, memory_order_release);
+                return;
+            }
+            chunk_done += (size_t) r;
+        }
+        done += chunk;
+    }
+
+    atomic_fetch_add_explicit(&e->stat_prefetch_bytes, (uint64_t) to_read, memory_order_relaxed);
+    // release-store: publishes the completed buffer to plan()'s acquire-load (invariant 4)
+    atomic_store_explicit(&e->pf_state[p], PF_READY, memory_order_release);
+}
+
+static void * moe_stream_pf_io_main(void * arg) {
+    (void) arg;
+    for (;;) {
+        struct moe_prefetch_req req;
+        if (moe_stream_pf_ring_pop(&req)) {
+            moe_stream_pf_do_fetch(&req);
+            continue;
+        }
+        if (atomic_load_explicit(&g_pf_shutdown, memory_order_acquire)) {
+            break;
+        }
+        // kimi-k3 pattern: 1ms-timeout condvar wait instead of a busy spin
+        pthread_mutex_lock(&g_pf_io_lock);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000;
+        if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec  += 1;
+            ts.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&g_pf_io_cond, &g_pf_io_lock, &ts);
+        pthread_mutex_unlock(&g_pf_io_lock);
+    }
+    return NULL;
+}
+
+// moe-stream has no per-entry teardown path today (atexit only, see the file
+// header). This only shuts down the global IO thread cleanly. Registered via
+// atexit() at first-spawn time (inside a plan() call, i.e. after model load),
+// which is always AFTER moe_stream_atexit's own atexit() registration (that
+// happens at model-load time, see ggml_moe_stream_register). atexit() runs
+// handlers LIFO, so this join always completes before moe_stream_atexit
+// prints the final prefetch stats below.
+static void moe_stream_pf_atexit_join(void) {
+    atomic_store_explicit(&g_pf_shutdown, 1, memory_order_release);
+    pthread_mutex_lock(&g_pf_io_lock);
+    pthread_cond_signal(&g_pf_io_cond);
+    pthread_mutex_unlock(&g_pf_io_lock);
+    pthread_join(g_pf_io_thread, NULL);
+}
+
+static void moe_stream_pf_thread_init(void) {
+    if (moe_stream_stats_enabled()) {
+        pthread_mutex_lock(&g_registry_lock);
+        const size_t budget  = moe_stream_prefetch_budget_bytes();
+        const size_t used    = budget - g_pf_budget_remaining;
+        const int    granted = g_pf_tensors_granted;
+        const int    total   = g_n_entries;
+        pthread_mutex_unlock(&g_registry_lock);
+        fprintf(stderr, "[moe-stream] prefetch: granted %d/%d tensor(s) %zu MiB of %zu MiB budget (slots=%d depth=%d)\n",
+                granted, total, used / (1024 * 1024), budget / (1024 * 1024),
+                moe_stream_prefetch_slots_env(), moe_stream_prefetch_depth_env());
+    }
+    atomic_store_explicit(&g_pf_shutdown, 0, memory_order_relaxed);
+    int rc = pthread_create(&g_pf_io_thread, NULL, moe_stream_pf_io_main, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "ggml_moe_stream: failed to spawn prefetch IO thread: %s (prefetch disabled for this run)\n",
+                strerror(rc));
+        return;
+    }
+    atomic_store_explicit(&g_pf_thread_live, 1, memory_order_release);
+    atexit(moe_stream_pf_atexit_join);
+}
+
+// Lazy-spawns the one global IO thread on the first plan() call with
+// prefetch on. pthread_once makes this safe even if two threadpools from
+// separate llama_context instances both call plan() concurrently.
+static void moe_stream_pf_ensure_thread(void) {
+    pthread_once(&g_pf_once, moe_stream_pf_thread_init);
+}
+
+// caller must NOT hold e->lock (called after ggml_moe_stream_plan releases
+// it -- see the deadlock-avoidance note there). Locks each target tensor's
+// own lock with trylock, one at a time, never nesting two entry locks.
+static void moe_stream_prefetch_enqueue_predictions(struct moe_stream_entry * e) {
+    const int e_idx = (int) (e - g_entries);
+    const int depth = moe_stream_prefetch_depth_env();
+
+    for (int d = 1; d <= depth; d++) {
+        const int f_idx = e_idx + d;
+        if (f_idx >= g_n_entries) {
+            break;
+        }
+        struct moe_stream_entry * f = &g_entries[f_idx];
+        if (f->pf_n_slots <= 0) {
+            continue; // this tensor got no prefetch slots from the RAM budget
+        }
+        if (pthread_mutex_trylock(&f->lock) != 0) {
+            continue; // f's own plan() owns the lock right now -- skip this round
+        }
+
+        int n_free = 0;
+        for (int p = 0; p < f->pf_n_slots; p++) {
+            if (atomic_load_explicit(&f->pf_state[p], memory_order_relaxed) == PF_FREE) {
+                n_free++;
+            }
+        }
+
+        // top-M (M = however many PF_FREE slots f has right now) experts by
+        // use_count that are neither resident nor already claimed by an
+        // earlier prediction for f
+        for (int pick = 0; pick < n_free; pick++) {
+            int      best      = -1;
+            uint64_t best_freq = 0;
+            for (int i = 0; i < f->n_expert; i++) {
+                if (f->expert_to_slot[i] >= 0 || f->use_count[i] == 0) {
+                    continue; // resident, or never routed -- not worth predicting
+                }
+                bool already_pf = false;
+                for (int p = 0; p < f->pf_n_slots; p++) {
+                    // state check MUST come first: it's the acquire-load that
+                    // establishes happens-before with the IO thread's writes,
+                    // via the ring's release/acquire pair (see
+                    // moe_stream_pf_do_fetch). Reading pf_expert_id before an
+                    // acquire that observes it is a data race even though f->lock
+                    // is held here -- the IO thread's abandon-on-error path
+                    // writes pf_expert_id without taking any entry lock.
+                    if (atomic_load_explicit(&f->pf_state[p], memory_order_acquire) != PF_FREE &&
+                        f->pf_expert_id[p] == i) {
+                        already_pf = true;
+                        break;
+                    }
+                }
+                if (already_pf) {
+                    continue;
+                }
+                if (best < 0 || f->use_count[i] > best_freq) {
+                    best      = i;
+                    best_freq = f->use_count[i];
+                }
+            }
+            if (best < 0) {
+                break; // no more candidates worth predicting
+            }
+
+            int slot_p = -1;
+            for (int p = 0; p < f->pf_n_slots; p++) {
+                if (atomic_load_explicit(&f->pf_state[p], memory_order_relaxed) == PF_FREE) {
+                    slot_p = p;
+                    break;
+                }
+            }
+            if (slot_p < 0) {
+                break; // n_free was stale (shouldn't happen under a single trylock owner, but be safe)
+            }
+
+            // claim first (PF_INFLIGHT), publish second (ring push) -- the IO
+            // thread must never see a request for a slot that isn't claimed yet
+            f->pf_expert_id[slot_p] = best;
+            atomic_store_explicit(&f->pf_state[slot_p], PF_INFLIGHT, memory_order_release);
+
+            const struct moe_prefetch_req req = { .e = f, .expert_id = best, .pf_slot_idx = slot_p };
+            if (!moe_stream_pf_ring_push(&req)) {
+                // ring full: undo the claim so the slot stays available
+                f->pf_expert_id[slot_p] = -1;
+                atomic_store_explicit(&f->pf_state[slot_p], PF_FREE, memory_order_relaxed);
+                f->stat_prefetch_ring_full++;
+                break; // ring is globally full -- further attempts this round will fail too
+            }
+            f->stat_prefetch_issued++;
+        }
+
+        pthread_mutex_unlock(&f->lock);
+    }
+}
+
 void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_counts, int n_expert) {
     struct moe_stream_entry * e = moe_stream_find_entry(t);
     if (!e) {
@@ -461,6 +903,16 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
 
     e->clock++;
     e->n_misses = 0;
+
+    // reset this cycle's per-miss chunk-completion counters (bounded by
+    // n_slots, the max possible misses); thread 0 only, so plain writes
+    // under the release below are fine -- fetch_chunk() only reads/writes
+    // indices [0, n_misses) which are (re)assigned again a few lines down
+    if (e->miss_chunks_done) {
+        for (int i = 0; i < e->n_slots; i++) {
+            atomic_store_explicit(&e->miss_chunks_done[i], 0, memory_order_relaxed);
+        }
+    }
 
     const int n = n_expert < e->n_expert ? n_expert : e->n_expert;
 
@@ -518,7 +970,40 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         if (slot >= 0) {
             e->slots[slot].last_use = e->clock;
             e->stat_hits++;
+            // superseded-prefetch cleanup: `i` may ALSO be sitting PF_READY
+            // in a prefetch slot (a prediction that lost the race to this
+            // demand fetch, or to an earlier promotion). Keep the normal
+            // slot, free the pf slot back to PF_FREE (invalidation subtlety).
+            if (e->pf_n_slots > 0) {
+                for (int p = 0; p < e->pf_n_slots; p++) {
+                    // acquire-load first: see the comment in
+                    // moe_stream_prefetch_enqueue_predictions -- this is the
+                    // edge that makes reading pf_expert_id[p] safe.
+                    if (atomic_load_explicit(&e->pf_state[p], memory_order_acquire) == PF_READY &&
+                        e->pf_expert_id[p] == i) {
+                        e->pf_expert_id[p] = -1;
+                        atomic_store_explicit(&e->pf_state[p], PF_FREE, memory_order_release);
+                        e->stat_prefetch_wasted++;
+                        break;
+                    }
+                }
+            }
             continue;
+        }
+
+        // promotion: is `i` sitting PF_READY in a prefetch slot? A
+        // PF_INFLIGHT match is treated as a plain miss below and re-derived
+        // as superseded on a later plan() once it turns PF_READY (invariant 3
+        // -- plan() never blocks on the IO thread).
+        int promoted_from = -1;
+        if (e->pf_n_slots > 0) {
+            for (int p = 0; p < e->pf_n_slots; p++) {
+                if (atomic_load_explicit(&e->pf_state[p], memory_order_acquire) == PF_READY &&
+                    e->pf_expert_id[p] == i) {
+                    promoted_from = p;
+                    break;
+                }
+            }
         }
 
         const int victim = moe_stream_pick_victim(e);
@@ -532,6 +1017,26 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
             e->expert_to_slot[old_expert] = -1;
         }
 
+        if (promoted_from >= 0) {
+            // promote by swap: two pointer writes, never a memcpy (invariant
+            // 1/2 -- this runs under e->lock in plan(), before any barrier
+            // releases compute threads, so compute never reads a pf buffer)
+            void * tmp = e->slots[victim].data;
+            e->slots[victim].data           = e->pf_slots[promoted_from].data;
+            e->pf_slots[promoted_from].data = tmp;
+
+            e->pf_expert_id[promoted_from] = -1;
+            atomic_store_explicit(&e->pf_state[promoted_from], PF_FREE, memory_order_release);
+
+            e->slots[victim].expert_id = i;
+            e->slots[victim].last_use  = e->clock;
+            e->expert_to_slot[i] = victim;
+
+            e->stat_hits++;
+            e->stat_prefetch_hits++;
+            continue;
+        }
+
         e->slots[victim].expert_id = i;
         e->slots[victim].last_use  = e->clock;
         e->expert_to_slot[i] = victim;
@@ -542,7 +1047,21 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         e->stat_misses++;
     }
 
+    if (moe_stream_prefetch_enabled() && e->n_misses > 0) {
+        atomic_fetch_add_explicit(&g_demand_pending, e->n_misses, memory_order_relaxed);
+    }
+
     pthread_mutex_unlock(&e->lock);
+
+    // Prediction enqueue happens AFTER releasing e->lock, one target lock at
+    // a time via trylock -- never hold two entry locks at once (deadlock
+    // avoidance), see moe_stream_prefetch_enqueue_predictions.
+    if (moe_stream_prefetch_enabled()) {
+        moe_stream_pf_ensure_thread();
+        if (atomic_load_explicit(&g_pf_thread_live, memory_order_acquire)) {
+            moe_stream_prefetch_enqueue_predictions(e);
+        }
+    }
 }
 
 int ggml_moe_stream_n_slots(const struct ggml_tensor * t) {
@@ -639,6 +1158,16 @@ void ggml_moe_stream_fetch_chunk(const struct ggml_tensor * t, int miss_idx, int
 
     atomic_fetch_add_explicit(&e->stat_bytes_read, (uint64_t) to_read, memory_order_relaxed);
     atomic_fetch_sub_explicit(&g_inflight, 1, memory_order_relaxed);
+
+    // g_demand_pending tracks outstanding demand-fetch chunks so the prefetch
+    // IO thread can yield the bus to them; decrement once per miss, on its
+    // LAST chunk (n_chunks==1 -- the common case -- always fires this).
+    if (e->miss_chunks_done) {
+        const int chunks_done = atomic_fetch_add_explicit(&e->miss_chunks_done[miss_idx], 1, memory_order_acq_rel) + 1;
+        if (chunks_done == n_chunks) {
+            atomic_fetch_sub_explicit(&g_demand_pending, 1, memory_order_release);
+        }
+    }
 }
 
 const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int expert_id) {

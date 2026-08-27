@@ -25,6 +25,20 @@
 //                                fan-out on the single-group decode fast path (default off)
 //   GGML_MOE_STREAM_FETCH_THREADS=<n>  threads dedicated to the fetch fan-out under
 //                                HITFIRST; the rest compute hits concurrently (default 2)
+//   GGML_MOE_STREAM_PREFETCH=1   enable a background IO thread that speculatively
+//                                pre-reads likely-next experts into extra landing slots
+//                                during the idle bus time between fetch phases (default off,
+//                                zero behavior change when unset -- byte-identical output)
+//   GGML_MOE_STREAM_PREFETCH_SLOTS=<n>  extra landing slots reserved per tensor for
+//                                prefetch, on top of GGML_MOE_STREAM_SLOTS (default 4)
+//   GGML_MOE_STREAM_PREFETCH_DEPTH=<n>  how many tensors ahead (registration order,
+//                                which tracks layer execution order) to predict likely
+//                                experts for on every plan() call (default 2)
+//   GGML_MOE_STREAM_PREFETCH_MB=<n>     total prefetch-arena RAM budget across ALL
+//                                tensors, in MiB (default 2048). Tensors are granted
+//                                their full GGML_MOE_STREAM_PREFETCH_SLOTS allotment,
+//                                all-or-nothing, until the budget runs out; later
+//                                tensors then get zero prefetch slots.
 
 #include "ggml.h"
 
