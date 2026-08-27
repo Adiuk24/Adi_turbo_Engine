@@ -56,6 +56,11 @@ struct moe_stream_entry {
     int n_expert;
     int n_slots;
 
+    // -1 if `name` doesn't match "blk.%d.": a same-`layer_id` pair of entries
+    // are sibling tensors of one transformer layer's MoE (ffn_gate/down/up_exps),
+    // which share IDENTICAL per-token routing -- see moe_stream_prefetch_enqueue_predictions.
+    int layer_id;
+
     struct moe_slot * slots;         // [n_slots]
     uint64_t        * use_count;     // [n_expert], LFU frequency (also the cumulative
                                       // route-frequency counter pinlru pins from)
@@ -73,6 +78,14 @@ struct moe_stream_entry {
                               // needs from being evicted by a later miss in
                               // the SAME plan() call (a group's experts, or --
                               // pre-chunking -- a whole call's experts)
+
+    // routed_now: snapshot of this plan() call's routed expert ids (row_counts>0),
+    // written under e->lock in ggml_moe_stream_plan and read (lock-free) by
+    // moe_stream_prefetch_enqueue_predictions right after, from the SAME thread
+    // (thread 0) later in the same plan() call -- never a different thread, so
+    // no atomics needed for this array.
+    int  * routed_now;   // [n_slots] max possible routed experts per call
+    int    n_routed_now;
 
     pthread_mutex_t lock;
 
@@ -96,6 +109,7 @@ struct moe_stream_entry {
     uint64_t          stat_prefetch_hits;   // promotions
     uint64_t          stat_prefetch_wasted; // superseded by a demand fetch before promotion
     uint64_t          stat_prefetch_ring_full;
+    uint64_t          stat_prefetch_late;   // routed expert found PF_INFLIGHT (invariant-3 double read)
     _Atomic uint64_t stat_prefetch_bytes;   // speculative bytes, kept separate from stat_bytes_read
 };
 
@@ -401,28 +415,30 @@ static void moe_stream_atexit(void) {
                 (unsigned long long) e->stat_chunked_calls,
                 pinned);
         if (moe_stream_prefetch_enabled() && e->pf_n_slots > 0) {
-            fprintf(stderr, "[moe-stream]   prefetch: pf_slots=%d issued=%llu hits=%llu wasted=%llu ring_full=%llu bytes=%llu\n",
+            fprintf(stderr, "[moe-stream]   prefetch: pf_slots=%d issued=%llu hits=%llu wasted=%llu ring_full=%llu late=%llu bytes=%llu\n",
                     e->pf_n_slots,
                     (unsigned long long) e->stat_prefetch_issued,
                     (unsigned long long) e->stat_prefetch_hits,
                     (unsigned long long) e->stat_prefetch_wasted,
                     (unsigned long long) e->stat_prefetch_ring_full,
+                    (unsigned long long) e->stat_prefetch_late,
                     (unsigned long long) e->stat_prefetch_bytes);
         }
     }
     if (moe_stream_prefetch_enabled()) {
-        uint64_t tot_issued = 0, tot_hits = 0, tot_wasted = 0, tot_ring_full = 0, tot_bytes = 0;
+        uint64_t tot_issued = 0, tot_hits = 0, tot_wasted = 0, tot_ring_full = 0, tot_late = 0, tot_bytes = 0;
         for (int i = 0; i < g_n_entries; i++) {
             struct moe_stream_entry * e = &g_entries[i];
             tot_issued    += e->stat_prefetch_issued;
             tot_hits      += e->stat_prefetch_hits;
             tot_wasted    += e->stat_prefetch_wasted;
             tot_ring_full += e->stat_prefetch_ring_full;
+            tot_late      += e->stat_prefetch_late;
             tot_bytes     += e->stat_prefetch_bytes;
         }
-        fprintf(stderr, "[moe-stream] prefetch totals: issued=%llu hits=%llu wasted=%llu ring_full=%llu bytes=%llu\n",
+        fprintf(stderr, "[moe-stream] prefetch totals: issued=%llu hits=%llu wasted=%llu ring_full=%llu late=%llu bytes=%llu\n",
                 (unsigned long long) tot_issued, (unsigned long long) tot_hits, (unsigned long long) tot_wasted,
-                (unsigned long long) tot_ring_full, (unsigned long long) tot_bytes);
+                (unsigned long long) tot_ring_full, (unsigned long long) tot_late, (unsigned long long) tot_bytes);
     }
     if (getenv("GGML_MOE_STREAM_HIST")) {
         moe_stream_dump_hist();
@@ -481,6 +497,8 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
 
     e->tensor    = t;
     snprintf(e->name, sizeof(e->name), "%s", ggml_get_name(t));
+    e->layer_id  = -1;
+    sscanf(e->name, "blk.%d.", &e->layer_id);
     e->fd        = fd;
     e->file_offs = file_offs;
     e->slab_bytes = t->nb[2];
@@ -501,7 +519,9 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
     e->miss_expert_id  = malloc((size_t) e->n_slots * sizeof(int));
     e->miss_slot_idx   = malloc((size_t) e->n_slots * sizeof(int));
     e->active_this_call = calloc((size_t) e->n_expert, sizeof(bool));
-    if (!e->slots || !e->use_count || !e->expert_to_slot || !e->miss_expert_id || !e->miss_slot_idx || !e->active_this_call) {
+    e->routed_now      = malloc((size_t) e->n_slots * sizeof(int));
+    e->n_routed_now    = 0;
+    if (!e->slots || !e->use_count || !e->expert_to_slot || !e->miss_expert_id || !e->miss_slot_idx || !e->active_this_call || !e->routed_now) {
         fprintf(stderr, "ggml_moe_stream: out of memory registering tensor '%s'\n", ggml_get_name(t));
         abort();
     }
@@ -825,10 +845,68 @@ static void moe_stream_prefetch_enqueue_predictions(struct moe_stream_entry * e)
             }
         }
 
-        // top-M (M = however many PF_FREE slots f has right now) experts by
-        // use_count that are neither resident nor already claimed by an
-        // earlier prediction for f
-        for (int pick = 0; pick < n_free; pick++) {
+        int n_claimed = 0;
+
+        // Sibling-exact: e and f are the same transformer layer's MoE tensors
+        // (ffn_gate/down/up_exps of the same blk.N -- see llama-model.cpp's
+        // per-layer tensor creation order, which registration mirrors), so they
+        // share IDENTICAL per-token routing. e->routed_now is not a guess, it's
+        // the exact set f will need a few tensors from now -- claim these before
+        // falling back to the frequency prior below, and push them to the ring
+        // first so they beat any cross-layer guess (FIFO ring; sibling lead time
+        // is the shortest of the two).
+        if (f->layer_id >= 0 && f->layer_id == e->layer_id) {
+            for (int r = 0; r < e->n_routed_now && n_claimed < n_free; r++) {
+                const int cand = e->routed_now[r];
+                if (f->expert_to_slot[cand] >= 0) {
+                    continue; // already resident in f
+                }
+                bool already_pf = false;
+                for (int p = 0; p < f->pf_n_slots; p++) {
+                    // state-first acquire-load, same rule as the frequency scan below
+                    if (atomic_load_explicit(&f->pf_state[p], memory_order_acquire) != PF_FREE &&
+                        f->pf_expert_id[p] == cand) {
+                        already_pf = true;
+                        break;
+                    }
+                }
+                if (already_pf) {
+                    continue;
+                }
+
+                int slot_p = -1;
+                for (int p = 0; p < f->pf_n_slots; p++) {
+                    if (atomic_load_explicit(&f->pf_state[p], memory_order_relaxed) == PF_FREE) {
+                        slot_p = p;
+                        break;
+                    }
+                }
+                if (slot_p < 0) {
+                    break; // n_free was stale (shouldn't happen under a single trylock owner, but be safe)
+                }
+
+                // claim first (PF_INFLIGHT), publish second (ring push), same as the
+                // frequency-prior path below
+                f->pf_expert_id[slot_p] = cand;
+                atomic_store_explicit(&f->pf_state[slot_p], PF_INFLIGHT, memory_order_release);
+
+                const struct moe_prefetch_req req = { .e = f, .expert_id = cand, .pf_slot_idx = slot_p };
+                if (!moe_stream_pf_ring_push(&req)) {
+                    f->pf_expert_id[slot_p] = -1;
+                    atomic_store_explicit(&f->pf_state[slot_p], PF_FREE, memory_order_relaxed);
+                    f->stat_prefetch_ring_full++;
+                    break; // ring is globally full -- further attempts this round will fail too
+                }
+                f->stat_prefetch_issued++;
+                n_claimed++;
+            }
+        }
+
+        // top-M (M = however many PF_FREE slots f had left after the sibling-exact
+        // pass above) experts by use_count that are neither resident nor already
+        // claimed by an earlier prediction for f (including the sibling-exact
+        // claims just made -- the already_pf scan below catches those too)
+        for (int pick = n_claimed; pick < n_free; pick++) {
             int      best      = -1;
             uint64_t best_freq = 0;
             for (int i = 0; i < f->n_expert; i++) {
@@ -903,6 +981,7 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
 
     e->clock++;
     e->n_misses = 0;
+    e->n_routed_now = 0;
 
     // reset this cycle's per-miss chunk-completion counters (bounded by
     // n_slots, the max possible misses); thread 0 only, so plain writes
@@ -964,6 +1043,11 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
             continue;
         }
 
+        // snapshot for sibling-exact prediction (moe_stream_prefetch_enqueue_predictions);
+        // bounded by n_slots per the caller's group-size contract (see above), so this
+        // never overflows the n_slots-sized routed_now array.
+        e->routed_now[e->n_routed_now++] = i;
+
         e->use_count[i]++;
 
         int slot = e->expert_to_slot[i];
@@ -998,9 +1082,18 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         int promoted_from = -1;
         if (e->pf_n_slots > 0) {
             for (int p = 0; p < e->pf_n_slots; p++) {
-                if (atomic_load_explicit(&e->pf_state[p], memory_order_acquire) == PF_READY &&
-                    e->pf_expert_id[p] == i) {
+                // state acquire-load first, same ordering rule as everywhere else
+                // touching pf_expert_id (see moe_stream_prefetch_enqueue_predictions).
+                const int st = atomic_load_explicit(&e->pf_state[p], memory_order_acquire);
+                if (st == PF_READY && e->pf_expert_id[p] == i) {
                     promoted_from = p;
+                    break;
+                }
+                if (st == PF_INFLIGHT && e->pf_expert_id[p] == i) {
+                    // invariant 3: plan() never blocks on the IO thread, so this
+                    // routed expert falls through to a plain miss below (a wasted
+                    // double read) instead of waiting for the pread to finish.
+                    e->stat_prefetch_late++;
                     break;
                 }
             }
