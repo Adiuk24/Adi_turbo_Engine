@@ -132,6 +132,24 @@ static int moe_stream_find_or_open_fd(const char * path) {
     if (fd < 0) {
         return -1;
     }
+    // GGML_MOE_STREAM_NOCACHE=1: bypass the page cache on the expert fetch path.
+    // At low hit rates the stream sweeps far more data than RAM, so caching it
+    // only double-copies every byte and evicts whatever mmap'd dense weights were
+    // resident (kimi-k3-in-c measured direct reads FASTER for the same regime).
+    const char * nc = getenv("GGML_MOE_STREAM_NOCACHE");
+    if (nc && atoi(nc) != 0) {
+#if defined(__APPLE__)
+        if (fcntl(fd, F_NOCACHE, 1) != 0) {
+            fprintf(stderr, "moe-stream: F_NOCACHE failed on %s (continuing buffered)\n", path);
+        } else {
+            fprintf(stderr, "moe-stream: page cache BYPASSED (F_NOCACHE) for %s\n", path);
+        }
+#elif defined(POSIX_FADV_DONTNEED)
+        // Linux: O_DIRECT needs aligned buffers we don't guarantee; advise-away instead.
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        fprintf(stderr, "moe-stream: POSIX_FADV_DONTNEED advised for %s\n", path);
+#endif
+    }
     if (g_n_fds < MOE_STREAM_MAX_TENSORS) {
         g_fds[g_n_fds].path = strdup(path);
         g_fds[g_n_fds].fd   = fd;
