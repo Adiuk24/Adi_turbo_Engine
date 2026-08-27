@@ -84,6 +84,15 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (n_blend_spans > 0) {
+        base["blend"] = {
+            {"spans",           n_blend_spans},
+            {"reused",          n_blend_reused},
+            {"recomputed",      n_blend_recomputed},
+            {"donor_coverage",  blend_donor_coverage_pct},
+        };
+    }
+
     return base;
 }
 

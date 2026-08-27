@@ -858,6 +858,16 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // "blend" (CacheBlend-style non-prefix KV reuse) donor state, see try_blend_prefill()
+    // seq id 1 is reserved for the donor snapshot; v1 requires n_parallel == 1 so this never
+    // collides with a client slot's own seq id (always 0), see LLAMA_MAX_SEQ bound in llama-kv-cells.h
+    static constexpr llama_seq_id BLEND_DONOR_SEQ = 1;
+    bool               blend_donor_valid = false;
+    llama_tokens       blend_donor_tokens;
+    std::vector<bool>  blend_donor_used;  // per donor position: true once consumed by an earlier blend request
+    int32_t            blend_min_span = 64; // env: LLAMA_BLEND_MIN_SPAN
+    int32_t            blend_repair   = 16; // env: LLAMA_BLEND_REPAIR
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -1255,6 +1265,18 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * LLAMA_BLEND_MIN_SPAN = getenv("LLAMA_BLEND_MIN_SPAN");
+            blend_min_span = LLAMA_BLEND_MIN_SPAN ? atoi(LLAMA_BLEND_MIN_SPAN) : 64;
+
+            const char * LLAMA_BLEND_REPAIR = getenv("LLAMA_BLEND_REPAIR");
+            blend_repair = LLAMA_BLEND_REPAIR ? atoi(LLAMA_BLEND_REPAIR) : 16;
+
+            if (LLAMA_BLEND_MIN_SPAN || LLAMA_BLEND_REPAIR) {
+                SRV_WRN("LLAMA_BLEND_MIN_SPAN = %d, LLAMA_BLEND_REPAIR = %d\n", blend_min_span, blend_repair);
             }
         }
 
@@ -2567,6 +2589,48 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_BLEND_ADOPT:
+                {
+                    // v1 always adopts from slot 0, see the "blend" design note above try_blend_prefill()
+                    server_slot * slot = get_slot_by_id(0);
+                    if (slot == nullptr) {
+                        send_error(task, "No slot 0 available for blend adopt", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    if (params_base.n_parallel != 1 || !params_base.kv_unified) {
+                        send_error(task, "blend requires the server to be started with -np 1 --kv-unified", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (slot->prompt.tokens.has_mtmd) {
+                        send_error(task, "blend donor cannot be adopted from a multimodal prompt", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    auto * mem = llama_get_memory(ctx_tgt);
+
+                    // drop any previous donor snapshot, then take a fresh copy of slot 0's live cache;
+                    // same-stream seq_cp only tags the cells, it does not touch slot 0's own data
+                    llama_memory_seq_rm(mem, BLEND_DONOR_SEQ, -1, -1);
+                    llama_memory_seq_cp(mem, slot->id, BLEND_DONOR_SEQ, 0, -1);
+
+                    blend_donor_tokens = slot->prompt.tokens.get_text_tokens();
+                    blend_donor_used.assign(blend_donor_tokens.size(), false);
+                    blend_donor_valid = !blend_donor_tokens.empty();
+
+                    SRV_INF("blend: adopted donor from slot %d, n_donor_tokens = %zu\n", slot->id, blend_donor_tokens.size());
+
+                    auto res = std::make_unique<server_task_result_blend_adopt>();
+                    res->id             = task.id;
+                    res->success        = true;
+                    res->n_donor_tokens = blend_donor_tokens.size();
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -2642,6 +2706,245 @@ private:
                 slot.release();
             }
         }
+    }
+
+    // FNV-1a over an 8-token window, used to seed candidate donor positions for blend span matching
+    static uint64_t blend_hash_window(const llama_tokens & toks, int start) {
+        uint64_t h = 1469598103934665603ull;
+        for (int i = 0; i < 8; i++) {
+            h ^= (uint64_t) (uint32_t) toks[start + i];
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    // "blend": CacheBlend-style non-prefix KV reuse.
+    //
+    // Matches spans of the incoming prompt against the donor sequence adopted via
+    // POST /blend/adopt, reuses their KV cells via seq_cp + seq_add (an RoPE position
+    // shift, the same primitive --cache-reuse uses to slide a chunk into a new slot),
+    // and only decodes the positions that are not covered by a reused span plus a
+    // short repair window at the front of each span (to bound cross-attention error
+    // from the reordering). Everything else about the request (sampling, streaming,
+    // stopping) proceeds exactly as if this had been a normal full prefill.
+    //
+    // Donor rows are physically shared with the live slot's own KV rows in llama.cpp's
+    // unified (single-stream) cache: seq_cp only tags a cell for a second sequence, it
+    // does not duplicate the row. Shifting a cell's position with seq_add mutates that
+    // one physical row for every sequence that references it, so a reused span cannot
+    // be shifted without also corrupting the donor's own copy of that span - unless the
+    // donor's tag is removed from those exact rows first (while they are still at the
+    // donor's own, unambiguous position range). That is why every reused span "consumes"
+    // its donor range: this function detaches the donor's tag before shifting, and marks
+    // the range in blend_donor_used so later requests never try to read it from the
+    // donor again. A donor snapshot is therefore usable many times in total, but any
+    // given byte range only once, until the next /blend/adopt replaces it.
+    //
+    // Returns false, with no side effects at all, whenever blend does not apply or the
+    // resulting plan does not fit in one batch - callers must fall through to the normal
+    // full-prefill path in that case.
+    bool try_blend_prefill(server_slot & slot) {
+        if (!blend_donor_valid || blend_donor_tokens.empty()) {
+            return false;
+        }
+        if (params_base.n_parallel != 1 || !params_base.kv_unified) {
+            SLT_WRN(slot, "%s", "blend requires -np 1 --kv-unified, ignoring blend request\n");
+            return false;
+        }
+        if (mctx != nullptr || slot.task->tokens.has_mtmd || slot.can_speculate()) {
+            SLT_WRN(slot, "%s", "blend does not support multimodal or speculative decoding, ignoring blend request\n");
+            return false;
+        }
+        if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
+            SLT_WRN(slot, "%s", "blend requires a memory type that supports shifting, ignoring blend request\n");
+            return false;
+        }
+
+        const llama_tokens prompt   = slot.task->tokens.get_text_tokens();
+        const int           n_prompt = (int) prompt.size();
+        const int           n_donor  = (int) blend_donor_tokens.size();
+
+        if (n_prompt < blend_min_span) {
+            return false;
+        }
+
+        // seed candidates with a hash index of 8-token donor windows, then greedily grow
+        // the longest exact match at each unclaimed prompt position (O(n_prompt) positions,
+        // each doing O(candidates-per-window * match-length) work; degrades towards
+        // O(n_prompt * n_donor) only on pathologically repetitive token streams)
+        static constexpr int HASH_WIN = 8;
+        std::unordered_map<uint64_t, std::vector<int>> donor_index;
+        if (n_donor >= HASH_WIN) {
+            donor_index.reserve(n_donor);
+            for (int d = 0; d + HASH_WIN <= n_donor; d++) {
+                donor_index[blend_hash_window(blend_donor_tokens, d)].push_back(d);
+            }
+        }
+
+        struct blend_span { int p; int d; int len; };
+        std::vector<blend_span> spans;
+        std::vector<bool> claimed(n_donor, false); // donor ranges already used by an earlier span in this same request
+
+        int p = 0;
+        while (p + blend_min_span <= n_prompt) {
+            int best_len = 0;
+            int best_d   = -1;
+
+            if (p + HASH_WIN <= n_prompt) {
+                auto it = donor_index.find(blend_hash_window(prompt, p));
+                if (it != donor_index.end()) {
+                    for (int d : it->second) {
+                        if (blend_donor_used[d] || claimed[d]) {
+                            continue;
+                        }
+                        int len = 0;
+                        while (p + len < n_prompt && d + len < n_donor &&
+                               prompt[p + len] == blend_donor_tokens[d + len] &&
+                               !blend_donor_used[d + len] && !claimed[d + len]) {
+                            len++;
+                        }
+                        if (len > best_len) {
+                            best_len = len;
+                            best_d   = d;
+                        }
+                    }
+                }
+            }
+
+            if (best_len >= blend_min_span) {
+                spans.push_back({p, best_d, best_len});
+                for (int k = 0; k < best_len; k++) {
+                    claimed[best_d + k] = true;
+                }
+                p += best_len;
+            } else {
+                p += 1;
+            }
+        }
+
+        if (spans.empty()) {
+            return false;
+        }
+
+        // repair window per span, clamped to the span length; a span reaching the very
+        // end of the prompt is repaired in full so the final token is always freshly
+        // decoded (logits are only ever valid for a token that was just computed)
+        std::vector<int> repair_w(spans.size());
+        for (size_t i = 0; i < spans.size(); i++) {
+            repair_w[i] = std::min<int>(blend_repair, spans[i].len);
+            if (spans[i].p + spans[i].len == n_prompt) {
+                repair_w[i] = spans[i].len;
+            }
+        }
+
+        // positions that still need a real decode: gaps around/between spans, plus repair windows
+        std::vector<int> decode_pos;
+        decode_pos.reserve(n_prompt);
+        int cursor = 0;
+        for (size_t i = 0; i < spans.size(); i++) {
+            for (int q = cursor; q < spans[i].p; q++) {
+                decode_pos.push_back(q);
+            }
+            for (int q = 0; q < repair_w[i]; q++) {
+                decode_pos.push_back(spans[i].p + q);
+            }
+            cursor = spans[i].p + spans[i].len;
+        }
+        for (int q = cursor; q < n_prompt; q++) {
+            decode_pos.push_back(q);
+        }
+
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+        if ((int) decode_pos.size() > n_batch) {
+            SLT_WRN(slot, "blend plan needs %d fresh tokens, exceeds n_batch = %d, falling back to full prefill\n",
+                    (int) decode_pos.size(), n_batch);
+            return false;
+        }
+
+        // --- commit: everything above was pure planning, nothing has been mutated yet ---
+        auto * mem = llama_get_memory(ctx_tgt);
+
+        if (!llama_memory_seq_rm(mem, slot.id, -1, -1)) {
+            SLT_WRN(slot, "%s", "blend: failed to clear live sequence, falling back to full prefill\n");
+            return false;
+        }
+
+        bool ok = true;
+        for (size_t i = 0; i < spans.size() && ok; i++) {
+            const auto & sp = spans[i];
+
+            llama_memory_seq_cp(mem, BLEND_DONOR_SEQ, slot.id, sp.d, sp.d + sp.len);
+
+            // detach the donor's tag while the rows are still at the donor's own position
+            // range (see the design note above) - this is what makes the shift below safe
+            if (!llama_memory_seq_rm(mem, BLEND_DONOR_SEQ, sp.d, sp.d + sp.len)) {
+                ok = false;
+                break;
+            }
+
+            llama_memory_seq_add(mem, slot.id, sp.d, sp.d + sp.len, sp.p - sp.d);
+
+            if (repair_w[i] > 0 && !llama_memory_seq_rm(mem, slot.id, sp.p, sp.p + repair_w[i])) {
+                ok = false;
+                break;
+            }
+        }
+
+        if (!ok) {
+            SLT_WRN(slot, "%s", "blend: KV assembly failed midway, resetting slot and falling back to full prefill\n");
+            llama_memory_seq_rm(mem, slot.id, -1, -1);
+            slot.prompt.clear();
+            return false;
+        }
+
+        for (const auto & sp : spans) {
+            for (int k = 0; k < sp.len; k++) {
+                blend_donor_used[sp.d + k] = true;
+            }
+        }
+
+        // token identities are already known in full - no need to discover them incrementally
+        slot.prompt.tokens.clear();
+        for (int i = 0; i < n_prompt; i++) {
+            slot.prompt.tokens.push_back(prompt[i]);
+        }
+
+        bool add_ok = true;
+        for (int pos : decode_pos) {
+            add_ok &= batch.add(slot.id, prompt[pos], pos, /* output = */ false, /* is_prompt = */ true);
+        }
+
+        if (!add_ok) {
+            // should not happen, decode_pos.size() was already checked against n_batch above
+            SLT_ERR(slot, "%s", "blend: batch overflow while queuing decode positions\n");
+            llama_memory_seq_rm(mem, slot.id, -1, -1);
+            slot.prompt.clear();
+            return false;
+        }
+
+        batch.set_output(batch.size() - 1, true);
+
+        const uint64_t n_reused     = n_prompt - decode_pos.size();
+        const uint64_t n_recomputed = decode_pos.size();
+
+        slot.stats.n_prompt_cached          = n_reused;
+        slot.stats.n_prompt_processed       = n_recomputed;
+        slot.stats.n_blend_spans            = spans.size();
+        slot.stats.n_blend_reused           = n_reused;
+        slot.stats.n_blend_recomputed       = n_recomputed;
+        slot.stats.blend_donor_coverage_pct = n_donor > 0 ? (100.0 * n_reused / n_donor) : 0.0;
+
+        metrics.add_prompt_cached(n_reused);
+
+        SLT_INF(slot, "blend: n_prompt = %d, spans = %zu, reused = %" PRIu64 ", recomputed = %" PRIu64 ", donor_coverage = %.1f%%\n",
+                n_prompt, spans.size(), n_reused, n_recomputed, slot.stats.blend_donor_coverage_pct);
+
+        slot.state       = SLOT_STATE_DONE_PROMPT;
+        slot.stats.n_gen = 0;
+        slot.i_batch     = batch.size() - 1;
+        slot.init_sampler();
+
+        return true;
     }
 
     // @ngxson : for debugging only
@@ -3095,6 +3398,10 @@ private:
                                                          slot.task->n_tokens(), slot.n_ctx),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
+                                return;
+                            }
+
+                            if (slot.task->params.blend && slot.task->params.cache_prompt && try_blend_prefill(slot)) {
                                 return;
                             }
 
@@ -5154,6 +5461,33 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_blend_adopt = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_BLEND_ADOPT);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_blend_adopt*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };

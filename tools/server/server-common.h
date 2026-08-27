@@ -353,6 +353,12 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // "blend" (CacheBlend-style non-prefix KV reuse) stats, see try_blend_prefill()
+    uint64_t n_blend_spans           = 0;
+    uint64_t n_blend_reused          = 0;
+    uint64_t n_blend_recomputed      = 0;
+    double   blend_donor_coverage_pct = 0.0;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

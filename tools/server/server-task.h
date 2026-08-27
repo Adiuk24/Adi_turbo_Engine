@@ -27,6 +27,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_BLEND_ADOPT,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -63,6 +64,8 @@ struct task_params {
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
+
+    bool blend = false; // reuse non-prefix KV spans from the adopted donor sequence, see POST /blend/adopt
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
@@ -561,6 +564,18 @@ struct server_task_result_get_lora : server_task_result {
 
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
+};
+
+struct server_task_result_blend_adopt : server_task_result {
+    bool   success        = false;
+    size_t n_donor_tokens = 0;
+
+    virtual json to_json() override {
+        return json {
+            {"success",        success},
+            {"n_donor_tokens", n_donor_tokens},
+        };
+    }
 };
 
 struct server_prompt {
