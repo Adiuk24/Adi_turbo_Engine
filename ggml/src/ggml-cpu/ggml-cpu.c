@@ -1747,7 +1747,12 @@ static void ggml_compute_forward_mul_mat_id(
     // zero extra barriers on the decode fast path.
     const int n_slots = ggml_moe_stream_n_slots(src0);
 
-    int active[n_as > 0 ? n_as : 1];
+    // fixed cap instead of a C99 VLA: MSVC has no VLAs (Windows port finding,
+    // ADIOS-WIN handoff 2026-08-25), and this is a hot path so no malloc either.
+    // 1024 covers every known MoE (Kimi K2/K3 = 896 experts).
+    #define MOE_STREAM_MAX_EXPERTS 1024
+    GGML_ASSERT(n_as <= MOE_STREAM_MAX_EXPERTS);
+    int active[MOE_STREAM_MAX_EXPERTS];
     int n_active = 0;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         if (matrix_row_counts[cur_a] > 0) {
@@ -1802,7 +1807,7 @@ static void ggml_compute_forward_mul_mat_id(
             } else {
                 // scope row_counts to just this group's experts so plan()
                 // only reserves slots for them
-                int64_t group_row_counts[n_as > 0 ? n_as : 1];
+                int64_t group_row_counts[MOE_STREAM_MAX_EXPERTS]; // no VLA: MSVC (see `active` above)
                 memset(group_row_counts, 0, n_as * sizeof(int64_t));
                 for (int k = g_start; k < g_end; ++k) {
                     group_row_counts[active[k]] = matrix_row_counts[active[k]];
