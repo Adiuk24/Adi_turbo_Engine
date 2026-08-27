@@ -21,6 +21,10 @@
 //   GGML_MOE_STREAM=1            enable streaming
 //   GGML_MOE_STREAM_SLOTS=<n>    slots per tensor (default 16, clamped to n_expert)
 //   GGML_MOE_STREAM_STATS=1      print one hits/misses/bytes_read line per tensor at exit
+//   GGML_MOE_STREAM_HITFIRST=1   overlap hit-expert compute with the miss-expert fetch
+//                                fan-out on the single-group decode fast path (default off)
+//   GGML_MOE_STREAM_FETCH_THREADS=<n>  threads dedicated to the fetch fan-out under
+//                                HITFIRST; the rest compute hits concurrently (default 2)
 
 #include "ggml.h"
 
@@ -91,6 +95,13 @@ GGML_API void ggml_moe_stream_fetch(const struct ggml_tensor * t, int miss_idx);
 // fetch phase (and its barrier) for the current plan; aborts if the expert is
 // not resident.
 GGML_API const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int expert_id);
+
+// Was `expert_id` a HIT (already resident, no pread needed) in the most
+// recent ggml_moe_stream_plan() call for this tensor? Only meaningful for an
+// expert that was active in that call (row_counts[expert_id] > 0) -- undefined
+// for anything else. Same validity window as ggml_moe_stream_n_misses() /
+// ggml_moe_stream_slab(): after that plan()'s barrier, before the next plan().
+GGML_API bool ggml_moe_stream_expert_is_hit(const struct ggml_tensor * t, int expert_id);
 
 #ifdef __cplusplus
 }

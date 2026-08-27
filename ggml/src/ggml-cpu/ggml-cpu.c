@@ -1761,6 +1761,36 @@ static void ggml_compute_forward_mul_mat_id(
         ggml_moe_stream_mark_chunked(src0);
     }
 
+    // GGML_MOE_STREAM_HITFIRST=1: the decode-phase stream is storage-bound
+    // (fetch occupies most of the wall-clock), yet a chunk of the routed
+    // experts are already resident (hits) and don't need to wait for the
+    // pread fan-out at all. When this fires, threads [0, nf) run the miss
+    // fetch fan-out below while threads [nf, nth) compute the hit experts
+    // concurrently; both groups sync before phase B computes the misses.
+    // Multi-group calls (prefill) reuse slots freed by earlier groups within
+    // the same call, so hit/miss status would need re-deriving per group --
+    // not worth it there; only the single-group decode fast path overlaps.
+    // Default is unset -> hf is always false -> byte-identical to before.
+    static int hitfirst_cached = -1;
+    if (hitfirst_cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_HITFIRST");
+        hitfirst_cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    const bool hf = hitfirst_cached && n_groups == 1 && nth >= 2;
+
+    int nf = 0; // fetch-fan-out participant count, only meaningful when hf
+    if (hf) {
+        static int fetch_threads_cached = -1;
+        if (fetch_threads_cached < 0) {
+            const char * v = getenv("GGML_MOE_STREAM_FETCH_THREADS");
+            int n = v ? atoi(v) : 2;
+            fetch_threads_cached = (n > 0) ? n : 2;
+        }
+        nf = fetch_threads_cached;
+        if (nf < 1)       nf = 1;
+        if (nf > nth - 1) nf = nth - 1; // leave >=1 thread to compute hits
+    }
+
     for (int g = 0; g < n_groups; ++g) {
         const int g_start = g * n_slots;
         const int g_end   = MIN(g_start + n_slots, n_active);
@@ -1779,28 +1809,89 @@ static void ggml_compute_forward_mul_mat_id(
                 }
                 ggml_moe_stream_plan(src0, group_row_counts, n_as);
             }
+            if (hf) {
+                // Phase A below computes hit experts with only (nth - nf)
+                // participants, not the usual nth -- retarget their
+                // work-steal counters (reset to nth for every expert just
+                // above this loop) to that smaller count so
+                // ggml_compute_forward_mul_mat_id_expert's chunk math and
+                // "am I done" check line up with who actually shows up. Miss
+                // counters are left at nth: they're computed in phase B by
+                // all nth threads, same as the plain path below.
+                for (int k = g_start; k < g_end; ++k) {
+                    const int cur_a = active[k];
+                    if (ggml_moe_stream_expert_is_hit(src0, cur_a)) {
+                        atomic_int * ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+                        atomic_store_explicit(ctr, nth - nf, memory_order_relaxed);
+                    }
+                }
+            }
         }
         ggml_barrier(params->threadpool);
         // thread 0 only, at barrier boundaries -> true wall-clock phase split
         const int64_t ms_t1 = ggml_time_us();
 
-        // parallel pread fan-out: each thread fetches a disjoint slice of the
-        // misses planned above, then all threads sync before touching slabs
-        const int n_misses = ggml_moe_stream_n_misses(src0);
-        // Split each miss's slab into chunks so all `nth` threads keep a read in
-        // flight for the whole fetch phase. With top-6 routing there are only ~6
-        // misses but 8 threads, so the SSD queue drained early: measured 900 MB/s
-        // against 1386 MB/s the device sustains at QD=6.
-        {
-            static int n_chunks = -1;
-            if (n_chunks < 0) {
-                const char * v = getenv("GGML_MOE_STREAM_CHUNKS");
-                int c = v ? atoi(v) : 1;
-                n_chunks = (c > 0) ? c : 1;
+        if (hf) {
+            // Phase A: threads [0, nf) fan out the miss preads exactly like
+            // the plain path below but with only nf participants; threads
+            // [nf, nth) compute the hit experts concurrently. plan()'s
+            // active_this_call protection (moe-stream.c) guarantees a slot
+            // that is a hit THIS call is never the victim picked for a miss
+            // THIS call, so the slabs phase A reads here and the slabs the
+            // fetch side writes are disjoint -- no race between the two
+            // thread groups. src1's vec_dot_type conversion above already
+            // finished (and was barriered) before this function's group loop
+            // even starts, so hit-compute's inputs are ready too.
+            if (ith < nf) {
+                const int n_misses = ggml_moe_stream_n_misses(src0);
+                static int n_chunks = -1;
+                if (n_chunks < 0) {
+                    const char * v = getenv("GGML_MOE_STREAM_CHUNKS");
+                    int c = v ? atoi(v) : 1;
+                    n_chunks = (c > 0) ? c : 1;
+                }
+                const int units = n_misses * n_chunks;
+                for (int u = ith; u < units; u += nf) {
+                    ggml_moe_stream_fetch_chunk(src0, u / n_chunks, u % n_chunks, n_chunks);
+                }
+            } else {
+                const int ith_local = ith - nf;
+                const int nth_local = nth - nf;
+                for (int k = g_start; k < g_end; ++k) {
+                    const int cur_a = active[k];
+                    if (!ggml_moe_stream_expert_is_hit(src0, cur_a)) {
+                        continue; // misses wait for phase B below
+                    }
+                    const int64_t cne1 = matrix_row_counts[cur_a];
+                    const char * src0_cur = ggml_moe_stream_slab(src0, cur_a);
+                    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+                    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+                    ggml_compute_forward_mul_mat_id_expert(
+                        dst, src0, src1, ids, cur_a, cne1, src0_cur,
+                        matrix_rows, row_size, src1_cont, wdata,
+                        atomic_current_chunk, ith_local, nth_local);
+                }
             }
-            const int units = n_misses * n_chunks;
-            for (int u = ith; u < units; u += nth) {
-                ggml_moe_stream_fetch_chunk(src0, u / n_chunks, u % n_chunks, n_chunks);
+        } else {
+            // parallel pread fan-out: each thread fetches a disjoint slice of the
+            // misses planned above, then all threads sync before touching slabs
+            const int n_misses = ggml_moe_stream_n_misses(src0);
+            // Split each miss's slab into chunks so all `nth` threads keep a read in
+            // flight for the whole fetch phase. With top-6 routing there are only ~6
+            // misses but 8 threads, so the SSD queue drained early: measured 900 MB/s
+            // against 1386 MB/s the device sustains at QD=6.
+            {
+                static int n_chunks = -1;
+                if (n_chunks < 0) {
+                    const char * v = getenv("GGML_MOE_STREAM_CHUNKS");
+                    int c = v ? atoi(v) : 1;
+                    n_chunks = (c > 0) ? c : 1;
+                }
+                const int units = n_misses * n_chunks;
+                for (int u = ith; u < units; u += nth) {
+                    ggml_moe_stream_fetch_chunk(src0, u / n_chunks, u % n_chunks, n_chunks);
+                }
             }
         }
         ggml_barrier(params->threadpool);
@@ -1808,6 +1899,9 @@ static void ggml_compute_forward_mul_mat_id(
 
         for (int k = g_start; k < g_end; ++k) {
             const int cur_a = active[k];
+            if (hf && ggml_moe_stream_expert_is_hit(src0, cur_a)) {
+                continue; // already computed in phase A above
+            }
             const int64_t cne1 = matrix_row_counts[cur_a];
 
             // streamed tensors never touch src0->data (the mmap'd pages of
@@ -1829,6 +1923,13 @@ static void ggml_compute_forward_mul_mat_id(
         if (ith == 0) {
             const int64_t ms_t3 = ggml_time_us();
             ggml_moe_stream_prof_add(0, ms_t1 - ms_t0);   // plan
+            // Under HITFIRST (hf), phase 1 also contains hit-expert compute
+            // running concurrently with the fetch fan-out (real disk-only
+            // time is <= this), and phase 2 only covers miss-expert compute
+            // (total compute time is phase 1's hidden portion plus this) --
+            // the plan/fetch/compute split stops being a clean partition of
+            // *what kind* of work happened in that mode, though it still
+            // sums to the same wall-clock total.
             ggml_moe_stream_prof_add(1, ms_t2 - ms_t1);   // fetch
             ggml_moe_stream_prof_add(2, ms_t3 - ms_t2);   // compute
         }

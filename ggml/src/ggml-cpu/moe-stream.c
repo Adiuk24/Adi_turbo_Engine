@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -46,10 +47,12 @@ struct moe_stream_entry {
     int n_slots;
 
     struct moe_slot * slots;         // [n_slots]
-    uint64_t        * use_count;     // [n_expert], LFU frequency
+    uint64_t        * use_count;     // [n_expert], LFU frequency (also the cumulative
+                                      // route-frequency counter pinlru pins from)
     int              * expert_to_slot; // [n_expert], -1 if not resident
     uint64_t           clock;
-    uint64_t           plan_calls; // for periodic LFU decay
+    uint64_t           plan_calls; // for periodic LFU decay / pinlru re-pin
+    int                pinned_expert; // pinlru only: sticky top-1 hottest expert, -1 = none yet
 
     // plan state for the in-flight mul_mat_id call (single-threaded producer
     // in ggml_moe_stream_plan, read-only fan-out consumers in ...fetch)
@@ -108,6 +111,22 @@ static bool moe_stream_stats_enabled(void) {
         cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
     }
     return cached != 0;
+}
+
+enum moe_evict_policy {
+    MOE_EVICT_LFU    = 0, // default: LFU-with-recency-tiebreak, periodic decay
+    MOE_EVICT_PINLRU = 1, // sticky top-1 pin per tensor + plain LRU for the rest
+};
+
+// GGML_MOE_STREAM_EVICT=pinlru switches eviction policy; anything else (unset
+// included) keeps the original LFU behavior.
+static enum moe_evict_policy moe_stream_evict_policy(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_EVICT");
+        cached = (v && strcmp(v, "pinlru") == 0) ? MOE_EVICT_PINLRU : MOE_EVICT_LFU;
+    }
+    return (enum moe_evict_policy) cached;
 }
 
 static size_t moe_stream_page_size(void) {
@@ -258,12 +277,16 @@ static void moe_stream_dump_hist(void) {
 static void moe_stream_atexit(void) {
     for (int i = 0; i < g_n_entries; i++) {
         struct moe_stream_entry * e = &g_entries[i];
-        fprintf(stderr, "[moe-stream] tensor=%s slots=%d hits=%llu misses=%llu bytes_read=%llu chunked_calls=%llu\n",
+        // pinned: 1 if this tensor's pinlru pin is currently resident, else 0
+        // (always 0 under plain LFU, since pinned_expert stays -1).
+        const int pinned = (e->pinned_expert >= 0 && e->expert_to_slot[e->pinned_expert] >= 0) ? 1 : 0;
+        fprintf(stderr, "[moe-stream] tensor=%s slots=%d hits=%llu misses=%llu bytes_read=%llu chunked_calls=%llu pinned=%d\n",
                 e->name, e->n_slots,
                 (unsigned long long) e->stat_hits,
                 (unsigned long long) e->stat_misses,
                 (unsigned long long) e->stat_bytes_read,
-                (unsigned long long) e->stat_chunked_calls);
+                (unsigned long long) e->stat_chunked_calls,
+                pinned);
     }
     if (getenv("GGML_MOE_STREAM_HIST")) {
         moe_stream_dump_hist();
@@ -350,6 +373,7 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
     for (int i = 0; i < e->n_expert; i++) {
         e->expert_to_slot[i] = -1;
     }
+    e->pinned_expert = -1;
 
     for (int s = 0; s < e->n_slots; s++) {
         e->slots[s].expert_id = -1;
@@ -364,6 +388,8 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
     }
 
     if (moe_stream_stats_enabled() && !g_atexit_registered) {
+        fprintf(stderr, "[moe-stream] eviction policy: %s\n",
+                moe_stream_evict_policy() == MOE_EVICT_PINLRU ? "pinlru" : "lfu");
         atexit(moe_stream_atexit);
         g_atexit_registered = 1;
     }
@@ -373,6 +399,20 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
 
 bool ggml_moe_stream_is_registered(const struct ggml_tensor * t) {
     return moe_stream_find_entry(t) != NULL;
+}
+
+// true if slot `s` is a better (more evictable) victim than the current
+// candidate `cur`, under the active policy. LFU: lowest use_count, recency
+// tiebreak. pinlru: lowest last_use (plain LRU) -- last_use is stamped with
+// e->clock on every hit and every fill, so it already doubles as an LRU stamp.
+static bool moe_stream_evicts_before(const struct moe_stream_entry * e, enum moe_evict_policy policy,
+                                      int s, int cur) {
+    if (policy == MOE_EVICT_PINLRU) {
+        return e->slots[s].last_use < e->slots[cur].last_use;
+    }
+    const uint64_t cur_freq = e->use_count[e->slots[cur].expert_id];
+    const uint64_t s_freq   = e->use_count[e->slots[s].expert_id];
+    return s_freq < cur_freq || (s_freq == cur_freq && e->slots[s].last_use < e->slots[cur].last_use);
 }
 
 // caller must hold e->lock. Never returns a slot whose occupant is marked
@@ -385,27 +425,30 @@ static int moe_stream_pick_victim(struct moe_stream_entry * e) {
             return s; // empty slots evict first
         }
     }
-    int best = -1;
+    const enum moe_evict_policy policy = moe_stream_evict_policy();
+    int best     = -1; // best candidate that also honors the pinlru pin
+    int fallback = -1; // best candidate ignoring the pin, used only if the pin leaves nothing else
     for (int s = 0; s < e->n_slots; s++) {
         const int occupant = e->slots[s].expert_id;
         if (e->active_this_call[occupant]) {
             continue;
         }
-        if (best == -1) {
-            best = s;
-            continue;
+        if (fallback == -1 || moe_stream_evicts_before(e, policy, s, fallback)) {
+            fallback = s;
         }
-        const uint64_t best_freq = e->use_count[e->slots[best].expert_id];
-        const uint64_t cur_freq  = e->use_count[occupant];
-        if (cur_freq < best_freq ||
-            (cur_freq == best_freq && e->slots[s].last_use < e->slots[best].last_use)) {
+        if (policy == MOE_EVICT_PINLRU && occupant == e->pinned_expert) {
+            continue; // pinned expert's slot is never chosen as a victim, except via fallback below
+        }
+        if (best == -1 || moe_stream_evicts_before(e, policy, s, best)) {
             best = s;
         }
     }
-    // never -1: at most n_slots-1 OTHER slots can be pinned by the time a
-    // miss needs one (this plan() call has at most n_slots active experts,
-    // by the caller's group-size contract), so a non-pinned slot always exists.
-    return best;
+    // never -1: at most n_slots-1 OTHER slots can be active_this_call (this
+    // plan() call has at most n_slots active experts, by the caller's
+    // group-size contract), so a non-active slot always exists as `fallback`.
+    // `best` alone can be -1 if the pin occupies the only non-active slot
+    // (e.g. n_slots==1) -- fall back to evicting the pin rather than stalling.
+    return best != -1 ? best : fallback;
 }
 
 void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_counts, int n_expert) {
@@ -432,14 +475,35 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         e->active_this_call[i] = row_counts[i] > 0;
     }
 
-    // Audit adoption (PR #25294's hotness decay): plain LFU never forgets, so an
-    // early-hot expert squats in a slot forever even after routing drifts with the
-    // topic. Halve all counts every 256 plan() calls (~256 decoded tokens per
-    // tensor); recency (last_use) still breaks ties.
     e->plan_calls++;
-    if ((e->plan_calls & 255) == 0) {
-        for (int i = 0; i < e->n_expert; i++) {
-            e->use_count[i] >>= 1;
+    const enum moe_evict_policy policy = moe_stream_evict_policy();
+    if (policy == MOE_EVICT_PINLRU) {
+        // Sticky top-1 pin: every 64 plan() calls, re-derive the hottest
+        // expert from the cumulative (never decayed, see the `else` below)
+        // route frequency and pin it. 64 (not 1024): plan() runs once per
+        // token per tensor, so a longer period would leave the pin dormant
+        // for the first ~1k decoded tokens; the top-1 cumulative count is
+        // stable enough that re-deriving often doesn't flap it.
+        if ((e->plan_calls & 63) == 0) {
+            int      top      = -1;
+            uint64_t top_freq = 0;
+            for (int i = 0; i < e->n_expert; i++) {
+                if (e->use_count[i] > top_freq) {
+                    top_freq = e->use_count[i];
+                    top      = i;
+                }
+            }
+            e->pinned_expert = top;
+        }
+    } else {
+        // Audit adoption (PR #25294's hotness decay): plain LFU never forgets, so an
+        // early-hot expert squats in a slot forever even after routing drifts with the
+        // topic. Halve all counts every 256 plan() calls (~256 decoded tokens per
+        // tensor); recency (last_use) still breaks ties.
+        if ((e->plan_calls & 255) == 0) {
+            for (int i = 0; i < e->n_expert; i++) {
+                e->use_count[i] >>= 1;
+            }
         }
     }
 
@@ -461,6 +525,9 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         // n_active <= e->n_slots (checked above) guarantees a non-pinned
         // slot always exists here.
         const int old_expert = e->slots[victim].expert_id;
+        // safety invariant: a slot this call still needs (active_this_call)
+        // must never be picked as a victim -- see moe_stream_pick_victim.
+        assert(old_expert < 0 || !e->active_this_call[old_expert]);
         if (old_expert >= 0) {
             e->expert_to_slot[old_expert] = -1;
         }
@@ -582,4 +649,23 @@ const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int expert_id) {
         abort();
     }
     return (const char *) e->slots[e->expert_to_slot[expert_id]].data;
+}
+
+// GGML_MOE_STREAM_HITFIRST support (ggml-cpu.c): was `expert_id` a hit in the
+// plan() call this call's miss_expert_id[]/n_misses describe? Read-only, no
+// lock -- called only in the window between that plan()'s barrier and the
+// next plan() (same contract as ggml_moe_stream_n_misses/slab above), by
+// which time miss_expert_id/n_misses are frozen until the next plan() call.
+// n_misses is bounded by n_slots (typically <=16), so the linear scan is cheap.
+bool ggml_moe_stream_expert_is_hit(const struct ggml_tensor * t, int expert_id) {
+    struct moe_stream_entry * e = moe_stream_find_entry(t);
+    if (!e) {
+        return false;
+    }
+    for (int i = 0; i < e->n_misses; i++) {
+        if (e->miss_expert_id[i] == expert_id) {
+            return false;
+        }
+    }
+    return true;
 }
