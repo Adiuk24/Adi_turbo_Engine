@@ -65,10 +65,12 @@ GGML_MOE_STREAM_SLOTS=16 GGML_MOE_STREAM_CHUNKS=4 \
 
 ## Known state / traps
 
-- `qwen4exp` (Qwen3.8-Flash-Next 180B): upstream support needs newer kv-cache
-  internals (`llama_kv_cell_ext.tok`, `for_each_token_in`) — a straight
-  cherry-pick does NOT build on this branch. Model is ready at
-  `/Volumes/MODELS/qwen38flash/Qwen3.8-Flash-Next-UD-Q3_K_XL-merged.gguf` (84G).
+- `qwen4exp` (Qwen3.8-Flash-Next 180B): WORKS as of 1d57fca084 (needed upstream
+  cherry-picks 925e117994 token-tracking + fac889fb38 TENSOR_READ_LAZY on top
+  of the 6c84c7d5d8 model commit). Smoke-verified 1.3 tok/s streamed off USB.
+  Model: `/Volumes/MODELS/qwen38flash/Qwen3.8-Flash-Next-UD-Q3_K_XL-merged.gguf` (84G).
+- Noor arch is NOT in this fork (separate noor-arch tree) — "unknown model
+  architecture: 'noor'" here is expected, not a regression.
 - Noor GGUFs: `o_proj` + shexp MUST stay F16; `tokenizer.ggml.pre` must be
   `deepseek-v3` for Bangla; shexp f32 in the converter for CPU.
 - Fused Metal GDN kernel scale at `ggml-metal.metal:2750,2869` is dormant and
