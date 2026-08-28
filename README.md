@@ -19,6 +19,7 @@ SSD (1.05 GB/s measured wall), temp-0, reproducible from this tree:
 | model | size on disk | decode |
 |---|---|---|
 | DeepSeek-V4-Flash 348B (Q2, top-3) | 90 GB | **1.1–1.3 tok/s** |
+| Qwen3.8-Flash-Next 180B (Q3, top-3 of 512) | 84 GB | **2.3–2.9 tok/s** (1.0–1.2 at stock top-10) |
 | gpt-oss-120B (MXFP4, top-3) | 59 GB | 1.3 tok/s |
 | Qwen3-Next-80B-A3B (Q3) | 36 GB | **4.5 tok/s** |
 | Qwen3-30B-A3B (Q3, streamed) | 14 GB | 3.4 tok/s |
