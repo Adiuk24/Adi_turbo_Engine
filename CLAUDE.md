@@ -95,6 +95,24 @@ GGML_MOE_STREAM_SLOTS=16 GGML_MOE_STREAM_CHUNKS=4 \
   reads per token (USB measured link-limited — QD is neutral there).
 - GGUF EOF-trailer sidecar (advisory-only) for slab index / routing priors /
   k-dial defaults — appends without rewriting a 200GB file.
+- Gate hardening (from CKE's verification notes, all cheap): (a) two-control
+  repeatability — run the baseline TWICE before trusting any parity red
+  (their 27B Q4_K_M was nondeterministic at 24 threads, first visible at
+  token 76); (b) canary neutrality — canaries-on vs off must be
+  byte-identical (fold into the pending fault-injection session); (c) lengthen
+  one greedy replay gate to 128+ tokens ("diverges coherently at token 40-50"
+  at cosine 0.9989 passes every shorter check); (d) thread-sweep the parity
+  assertion (t=1 vs t=8), not just the default; (e) replay gates assert the
+  RENDERED PROMPT STRING too — a numerically perfect model + wrong chat
+  template = garbage that byte-parity can't see; (f) three-way perf verdict:
+  keep / reject-if-wrong / research-only-if-no-model-level-gain, and keep a
+  permanent rejected-experiments list with reasons.
+- Noor multimodal (when OCR/vision lands): encoder/tokenizer PREFIX parity
+  before decode parity; a deliberately tiny/degenerate input in the corpus
+  (their 3x3-grid case scored 0.799 cosine where full-size scored 0.999);
+  preprocessing (resize/normalize) as its own pinned unit test; hash-pinned
+  5-sample gate per change, full corpus nightly; prefill-vs-decode
+  single-token equivalence gate (GDN has two code paths for the same math).
 - Checked and already correct (do NOT redo): last-only prefill logits (stock
   + blend), hot-path getenv caching, dynamic chunk-claiming in mul_mat/GDN,
   F_NOCACHE knob, contiguous slabs, head-parallel GDN, alternating-order A/B.
