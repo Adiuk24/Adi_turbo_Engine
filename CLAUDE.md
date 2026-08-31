@@ -71,6 +71,34 @@ GGML_MOE_STREAM_SLOTS=16 GGML_MOE_STREAM_CHUNKS=4 \
    the path (plus the numbers) in the commit message — a claim without its
    log is a builder report, not a result.
 
+## Upstream drift policy (two-lane, adopted from CKE's practice)
+
+- The fork's merge-base with upstream is the PINNED numerical oracle. A
+  periodic check may fetch upstream HEAD, report commit delta, and test-apply
+  our patch set — but a drift failure is EVIDENCE, never authorization to
+  widen a tolerance or move the pin. Moving the pin is its own reviewed
+  change, gated on identical-hardware parity runs.
+
+## Backlog (validated ideas, not yet built — from the 2026-08-31 CKE study)
+
+- Logit-level blend gate: token-identity parity passed in a case where logit
+  cosine was 0.866 (CKE's batched-prefill blocker) — add cosine/RMSE on
+  final-token logits at >=1k ctx to the blend gate.
+- Sparse cb_eval layer hook (public ggml API, no fork patch): per-layer
+  wall-time attribution separating bus stall / Metal / CPU expert GEMM, and a
+  first-divergent-LAYER oracle. Sparse l_out-N boundaries only — hooking
+  every node splits the graph and corrupts the measurement. Medians over
+  many tokens, never single-token totals.
+- Slot-pool telemetry: machine-readable eviction reason per victim +
+  exposed-wait-at-first-use vs hidden-behind-compute I/O accounting.
+- NVMe rig only: raise effective queue depth by batching all k routed-expert
+  reads per token (USB measured link-limited — QD is neutral there).
+- GGUF EOF-trailer sidecar (advisory-only) for slab index / routing priors /
+  k-dial defaults — appends without rewriting a 200GB file.
+- Checked and already correct (do NOT redo): last-only prefill logits (stock
+  + blend), hot-path getenv caching, dynamic chunk-claiming in mul_mat/GDN,
+  F_NOCACHE knob, contiguous slabs, head-parallel GDN, alternating-order A/B.
+
 ## Known state / traps
 
 - `qwen4exp` (Qwen3.8-Flash-Next 180B): WORKS as of 1d57fca084 (needed upstream
