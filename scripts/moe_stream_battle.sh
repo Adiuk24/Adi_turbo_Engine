@@ -30,7 +30,15 @@ parity(){
   if diff -q "$off" "$on" >/dev/null; then
     local miss=$(awk -F'misses=' '/moe-stream/{s+=$2+0} END{print s+0}' "$oe")
     ok "$name S=$slots — byte-identical, streamed (misses=$miss), RSS=${rss}GiB"
-  else no "$name S=$slots — OUTPUT DIFFERS from baseline"; fi
+  else
+    # first-divergence report (CKE-style): exact byte offset + context from both sides,
+    # so a parity failure names WHERE it broke instead of just that it broke.
+    local fdb=$(cmp "$off" "$on" 2>/dev/null | sed -n 's/.*char \([0-9]*\).*/\1/p'); fdb=${fdb:-0}
+    local ctx0=$((fdb>40 ? fdb-40 : 0))
+    no "$name S=$slots — OUTPUT DIFFERS from baseline (first divergence at byte $fdb)"
+    say "        baseline: ...$(tail -c +$((ctx0+1)) "$off" | head -c 80 | tr '\n' ' ')..."
+    say "        streamed: ...$(tail -c +$((ctx0+1)) "$on"  | head -c 80 | tr '\n' ' ')..."
+  fi
 }
 
 say "=== moe-stream battle test — $(date +%H:%M:%S) ==="
