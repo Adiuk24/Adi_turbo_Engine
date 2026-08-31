@@ -62,6 +62,14 @@ GGML_MOE_STREAM_SLOTS=16 GGML_MOE_STREAM_CHUNKS=4 \
 3. **Perf**: adjacent A/B, ABBA order, note swap/cache state. First run after
    big file I/O is a cold-cache outlier. USB decode is bus-bound — most knobs
    measure neutral there; report neutral as neutral.
+4. **First-divergence regression** (configs where exact parity isn't expected,
+   e.g. k-dial or mixed-precision): record WHERE output first diverges from
+   the reference (battle harness prints the byte offset). The divergence
+   point moving EARLIER after a change is a regression needing explanation,
+   even if the output "still looks fine".
+5. **Keep the logs**: save gate/bench output to /tmp or the run dir and put
+   the path (plus the numbers) in the commit message — a claim without its
+   log is a builder report, not a result.
 
 ## Known state / traps
 
