@@ -10,7 +10,11 @@
 #include <set>
 #include <stdexcept>
 
-#define MAX_REPETITION_THRESHOLD 2000
+// 2000 upstream. Raised for AdiTurbo: agent harnesses (qwen-code etc.) send
+// tool schemas whose length-capped strings expand past 2000 rules, and the
+// server refuses the request ("exceeds sane defaults"). The product guard
+// (product of chained repetitions) still applies at the higher bound.
+#define MAX_REPETITION_THRESHOLD 65536
 //
 // helpers
 //
