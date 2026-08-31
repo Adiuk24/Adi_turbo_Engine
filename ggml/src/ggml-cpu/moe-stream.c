@@ -26,6 +26,10 @@
 #define MOE_STREAM_MAX_TENSORS 512
 #define MOE_STREAM_ALIGN       (2 * 1024 * 1024) // 2 MiB, per harvested reference designs
 
+// GGML_MOE_STREAM_CANARY=1: 8-byte sentinel planted just past each slot's
+// slab_bytes region (see moe_canary_plant/moe_canary_check below).
+#define MOE_STREAM_CANARY_MAGIC ((uint64_t) 0xC0DEC0DECAFEF00DULL)
+
 // GGML_MOE_STREAM_PREFETCH=1: state machine for the P extra landing slots
 // reserved per tensor (see ggml-moe-stream.h). NORMAL slots (the original
 // n_slots) never carry this state -- only the P prefetch slots do.
@@ -104,6 +108,14 @@ struct moe_stream_entry {
                                         // on promotion (two pointer writes, never a memcpy)
     _Atomic int       * miss_chunks_done; // [n_slots], per-miss count of completed fetch_chunk() calls this
                                            // plan() cycle -- drives the g_demand_pending bus-yield signal
+
+    // ---- canary (GGML_MOE_STREAM_CANARY=1), see ggml-moe-stream.h ----
+    // Independent of miss_chunks_done above: that counter only exists when
+    // prefetch is on. canary_chunks_done tracks the same "last chunk of this
+    // miss just completed" event but only when canary mode is on, regardless
+    // of prefetch state, so the post-fetch canary check fires exactly once
+    // per miss even when a demand fetch is split across n_chunks callers.
+    _Atomic int       * canary_chunks_done; // [n_slots], NULL unless canary mode is enabled
 
     uint64_t          stat_prefetch_issued;
     uint64_t          stat_prefetch_hits;   // promotions
@@ -191,6 +203,19 @@ static bool moe_stream_stats_enabled(void) {
     return cached != 0;
 }
 
+// GGML_MOE_STREAM_CANARY=1: plant an 8-byte sentinel just past each slot's
+// slab_bytes region and abort with a diagnostic if a read/prefetch overruns
+// it. Default off -- zero allocation/behavior change when unset (see
+// moe_canary_alloc_bytes).
+static bool moe_stream_canary_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_CANARY");
+        cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 // GGML_MOE_STREAM_PREFETCH=1: enable the background speculative-prefetch IO
 // thread. Default off -- zero behavior change, byte-identical to before.
 static bool moe_stream_prefetch_enabled(void) {
@@ -265,6 +290,51 @@ static size_t moe_stream_page_size(void) {
         }
     }
     return (size_t) page;
+}
+
+// ---- canary (GGML_MOE_STREAM_CANARY=1) ----
+
+// Alloc size actually requested for a slot's slab. slab_alloc_bytes already
+// rounds slab_bytes up to a page, so there's usually >=8 bytes of page
+// padding free after the slab to plant a sentinel into. Only when the slab
+// is an exact page multiple (zero padding) do we grow the allocation by one
+// whole page -- and ONLY when canary_enabled is true. When it's false this
+// always returns e->slab_alloc_bytes unchanged: allocation size is
+// byte-identical to before this feature existed (invariant I1).
+static size_t moe_canary_alloc_bytes(const struct moe_stream_entry * e, bool canary_enabled) {
+    size_t bytes = e->slab_alloc_bytes;
+    if (canary_enabled && (e->slab_alloc_bytes - e->slab_bytes) < 8) {
+        bytes += moe_stream_page_size();
+    }
+    return bytes;
+}
+
+// Plants the sentinel strictly at slab_base + slab_bytes -- never inside the
+// slab_bytes region a kernel reads (invariant I2). Caller guarantees the
+// allocation is at least slab_bytes + 8 bytes (see moe_canary_alloc_bytes).
+static void moe_canary_plant(void * slab_base, size_t slab_bytes) {
+    const uint64_t magic = MOE_STREAM_CANARY_MAGIC;
+    memcpy((char *) slab_base + slab_bytes, &magic, sizeof(magic));
+}
+
+// Verifies the sentinel just past slab_base + e->slab_bytes. A mismatch means
+// something wrote past the slab_bytes region a pread/kernel is supposed to
+// stay within -- exactly the overrun class this feature exists to catch.
+// Loud and fatal by design: this is a memory-safety bug, not something to
+// paper over and keep running past.
+static void moe_canary_check(const struct moe_stream_entry * e, const void * slab_base,
+                              int slot_idx, int expert_id, const char * where) {
+    uint64_t found;
+    memcpy(&found, (const char *) slab_base + e->slab_bytes, sizeof(found));
+    const uint64_t expected = MOE_STREAM_CANARY_MAGIC;
+    if (found != expected) {
+        fprintf(stderr,
+                "ggml_moe_stream: CANARY CORRUPTION tensor='%s' slot=%d expert=%d where=%s "
+                "expected=0x%016llx found=0x%016llx\n",
+                e->name, slot_idx, expert_id, where,
+                (unsigned long long) expected, (unsigned long long) found);
+        abort();
+    }
 }
 
 // caller must hold g_registry_lock
@@ -531,16 +601,34 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
     }
     e->pinned_expert = -1;
 
+    const bool canary_enabled = moe_stream_canary_enabled();
+
     for (int s = 0; s < e->n_slots; s++) {
         e->slots[s].expert_id = -1;
         void * mem = NULL;
-        int rc = posix_memalign(&mem, MOE_STREAM_ALIGN, e->slab_alloc_bytes);
+        int rc = posix_memalign(&mem, MOE_STREAM_ALIGN, moe_canary_alloc_bytes(e, canary_enabled));
         if (rc != 0 || !mem) {
             fprintf(stderr, "ggml_moe_stream: posix_memalign failed for tensor '%s' slot %d\n",
                     ggml_get_name(t), s);
             abort();
         }
         e->slots[s].data = mem;
+        if (canary_enabled) {
+            moe_canary_plant(mem, e->slab_bytes);
+        }
+    }
+
+    e->canary_chunks_done = NULL;
+    if (canary_enabled) {
+        e->canary_chunks_done = malloc((size_t) e->n_slots * sizeof(_Atomic int));
+        if (!e->canary_chunks_done) {
+            fprintf(stderr, "ggml_moe_stream: out of memory allocating canary state for tensor '%s'\n",
+                    ggml_get_name(t));
+            abort();
+        }
+        for (int i = 0; i < e->n_slots; i++) {
+            atomic_init(&e->canary_chunks_done[i], 0);
+        }
     }
 
     // prefetch: grant this tensor P extra landing slots only if the global
@@ -580,7 +668,7 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
                 e->pf_expert_id[p] = -1;
                 atomic_init(&e->pf_state[p], PF_FREE);
                 void * mem = NULL;
-                int rc = posix_memalign(&mem, MOE_STREAM_ALIGN, e->slab_alloc_bytes);
+                int rc = posix_memalign(&mem, MOE_STREAM_ALIGN, moe_canary_alloc_bytes(e, canary_enabled));
                 if (rc != 0 || !mem) {
                     fprintf(stderr, "ggml_moe_stream: posix_memalign failed for tensor '%s' prefetch slot %d\n",
                             ggml_get_name(t), p);
@@ -588,6 +676,9 @@ void ggml_moe_stream_register(struct ggml_tensor * t, const char * path, size_t 
                 }
                 e->pf_slots[p].data       = mem;
                 e->pf_slots[p].expert_id  = -1;
+                if (canary_enabled) {
+                    moe_canary_plant(mem, e->slab_bytes);
+                }
             }
             for (int i = 0; i < e->n_slots; i++) {
                 atomic_init(&e->miss_chunks_done[i], 0);
@@ -743,6 +834,15 @@ static void moe_stream_pf_do_fetch(const struct moe_prefetch_req * req) {
     }
 
     atomic_fetch_add_explicit(&e->stat_prefetch_bytes, (uint64_t) to_read, memory_order_relaxed);
+
+    // canary check runs here, on the IO thread, BEFORE the PF_READY publish --
+    // this buffer is touched by nothing else until that release-store below
+    // (see the function comment above), so no lock is needed, same as every
+    // other access to a pf slot's buffer.
+    if (moe_stream_canary_enabled()) {
+        moe_canary_check(e, e->pf_slots[p].data, p, expert_id, "prefetch_fetch:complete");
+    }
+
     // release-store: publishes the completed buffer to plan()'s acquire-load (invariant 4)
     atomic_store_explicit(&e->pf_state[p], PF_READY, memory_order_release);
 }
@@ -992,6 +1092,13 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
             atomic_store_explicit(&e->miss_chunks_done[i], 0, memory_order_relaxed);
         }
     }
+    // canary: same per-cycle reset, independent counter (see the struct comment
+    // on canary_chunks_done -- this exists even when prefetch is off).
+    if (e->canary_chunks_done) {
+        for (int i = 0; i < e->n_slots; i++) {
+            atomic_store_explicit(&e->canary_chunks_done[i], 0, memory_order_relaxed);
+        }
+    }
 
     const int n = n_expert < e->n_expert ? n_expert : e->n_expert;
 
@@ -1103,6 +1210,15 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         // n_active <= e->n_slots (checked above) guarantees a non-pinned
         // slot always exists here.
         const int old_expert = e->slots[victim].expert_id;
+        // canary: verify the outgoing occupant's sentinel BEFORE this slot is
+        // reused (its metadata cleared below, its buffer promoted or handed to
+        // a later pread) -- this is the "eviction/reuse" check point. Runs
+        // under e->lock, single-threaded producer thread 0 (same discipline as
+        // everything else that mutates slot occupancy in plan()), so nothing
+        // else can be touching this slot's buffer right now.
+        if (moe_stream_canary_enabled() && old_expert >= 0) {
+            moe_canary_check(e, e->slots[victim].data, victim, old_expert, "plan:evict");
+        }
         // safety invariant: a slot this call still needs (active_this_call)
         // must never be picked as a victim -- see moe_stream_pick_victim.
         assert(old_expert < 0 || !e->active_this_call[old_expert]);
@@ -1259,6 +1375,26 @@ void ggml_moe_stream_fetch_chunk(const struct ggml_tensor * t, int miss_idx, int
         const int chunks_done = atomic_fetch_add_explicit(&e->miss_chunks_done[miss_idx], 1, memory_order_acq_rel) + 1;
         if (chunks_done == n_chunks) {
             atomic_fetch_sub_explicit(&g_demand_pending, 1, memory_order_release);
+        }
+    }
+
+    // canary: same "last chunk of this miss just landed" detection as above,
+    // but on its own counter so it fires whether or not prefetch (and thus
+    // miss_chunks_done) is enabled. Covers both the sync fetch path
+    // (n_chunks==1, fires immediately) and the chunked path (fires once, on
+    // whichever of the n_chunks callers completes last). All chunks write
+    // disjoint sub-ranges of [0, slab_bytes) -- see the split logic above --
+    // so the sentinel at e->slab_bytes is untouched by any of them; the
+    // acq_rel increment establishes happens-before with every chunk's pread,
+    // so reading it here from whichever thread finishes last is safe without
+    // a lock (same reasoning as e->miss_chunks_done above).
+    if (moe_stream_canary_enabled()) {
+        int chunks_done = 1;
+        if (n_chunks > 1 && e->canary_chunks_done) {
+            chunks_done = atomic_fetch_add_explicit(&e->canary_chunks_done[miss_idx], 1, memory_order_acq_rel) + 1;
+        }
+        if (chunks_done == n_chunks) {
+            moe_canary_check(e, e->slots[slot].data, slot, expert_id, "fetch_chunk:complete");
         }
     }
 }

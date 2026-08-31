@@ -39,6 +39,14 @@
 //                                their full GGML_MOE_STREAM_PREFETCH_SLOTS allotment,
 //                                all-or-nothing, until the budget runs out; later
 //                                tensors then get zero prefetch slots.
+//   GGML_MOE_STREAM_CANARY=1     plant an 8-byte sentinel just past each slot's
+//                                slab_bytes region (normal slots and prefetch landing
+//                                slots) and verify it after every completed fetch,
+//                                prefetch, and slot eviction; abort with a diagnostic
+//                                (tensor, slot, expert, call site, expected vs found
+//                                bytes) on mismatch -- a corrupted sentinel means a
+//                                read overran its slab. Default off, zero allocation
+//                                or behavior change when unset.
 
 #include "ggml.h"
 
