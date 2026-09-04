@@ -1,4 +1,18 @@
-# AdiTurbo Engine (llama.cpp fork)
+# AdiTurbo Engine (llama.cpp fork) — STANDALONE REPO
+
+**Location:** `~/aditurbo-engine`   **Canonical branch:** `engine-main`
+
+Moved out of `~/PAIA_V1` on 2026-09-04 and consolidated from five divergent
+worktrees into ONE branch. PAIA_V1 is a separate project; the engine is no
+longer inside it. `~/PAIA_V1/llama-cpp-turboquant` is retired and deletable.
+
+Installed to ADIOS at `/Volumes/MODELS/ADIOS/bin/` and `bin-noor/`
+(build 273, commit 9efe4786d). Previous engine preserved at
+`/Volumes/MODELS/ADIOS/bin.backup-20260904/`; the legacy Noor parity ORACLE is
+preserved at `/Volumes/MODELS/ADIOS/bin-noor.oracle-b8667/` (version 8667,
+b784cc570) — do not delete it, it is the independent verification binary.
+
+Validation gates + baselines: `~/engine_gates/`.
 
 This is **our fork**, not upstream llama.cpp. Product: moe-stream (SSD expert
 streaming) + KV persistence + blend. See README.md for the feature story and
@@ -6,7 +20,7 @@ measured numbers.
 
 ## Git rules (hard)
 
-- Push ONLY to `aditurbo` (Adiuk24/Adi_turbo_Engine), branch `moe-stream-upstream`.
+- Push ONLY to `aditurbo` (Adiuk24/Adi_turbo_Engine), branch `engine-main`.
 - NEVER push to `origin`/`upstream` (ggml-org) or `jjj`. Never open upstream
   PRs, issues, or comments — no external communication of any kind.
 - Commit agent/subagent work IMMEDIATELY before touching their files
