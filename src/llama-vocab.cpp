@@ -330,6 +330,16 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
                 };
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_BORNO:
+                // Borno v2 (Noor). tokenizer.json pre_tokenizer is a Sequence of
+                // WhitespaceSplit -> Punctuation(Isolated) -> ByteLevel(add_prefix_space=true,
+                // use_regex=false). borno_normalize() below reproduces the first two stages and
+                // materialises the unconditional prefix space, so every piece arrives here as
+                // exactly " <core>" and this regex only has to peel them apart again.
+                regex_exprs = {
+                    " ?[^\\s]+",
+                };
+                break;
             case LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_CODER:
                 regex_exprs = {
                     "[\r\n]",
@@ -558,6 +568,103 @@ struct llm_tokenizer_bpe : llm_tokenizer {
     bool byte_encode = true; // GPT-2 byte encoding; false for SPM-style BPE (raw UTF-8)
 };
 
+// Borno v2 (Noor): HF WhitespaceSplit -> Punctuation(Isolated) -> ByteLevel(add_prefix_space=true).
+// Splits on whitespace (which Borno DISCARDS -- "a\nb" and "a b" are the same token sequence),
+// isolates every \p{P} codepoint into its own piece, then gives every piece a leading space
+// because add_prefix_space applies per piece, not just at the start of the text. Emitting that
+// space here lets the ordinary byte-level path turn it into the Ġ the merges were trained on.
+// NOTE: Borno's normalizer is NFC; we do not normalise, so non-NFC input can still diverge.
+// Indic nukta forms are on Unicode's Composition Exclusion list, so NFC leaves them DECOMPOSED
+// (NFC(U+09DF য়) == U+09AF U+09BC, not U+09DF). Borno's NFC normalizer therefore trained its
+// merges on the decomposed form; feeding the engine a precomposed য় hits no vocab entry and
+// falls through to byte tokens. unicode_cpts_normalize_nfd() cannot serve here -- it is a
+// singleton map that returns the base letter and DROPS the nukta.
+// Scope: the Indic exclusions (Devanagari/Bengali/Gurmukhi/Oriya) this corpus actually contains.
+// Not full NFC -- no canonical reordering, no Latin composition. Text already in NFC is unaffected.
+static bool borno_nfc_decompose(uint32_t cpt, uint32_t & a, uint32_t & b) {
+    switch (cpt) {
+        case 0x0929: a = 0x0928; b = 0x093C; return true;
+        case 0x0931: a = 0x0930; b = 0x093C; return true;
+        case 0x0934: a = 0x0933; b = 0x093C; return true;
+        case 0x0958: a = 0x0915; b = 0x093C; return true;
+        case 0x0959: a = 0x0916; b = 0x093C; return true;
+        case 0x095A: a = 0x0917; b = 0x093C; return true;
+        case 0x095B: a = 0x091C; b = 0x093C; return true;
+        case 0x095C: a = 0x0921; b = 0x093C; return true;
+        case 0x095D: a = 0x0922; b = 0x093C; return true;
+        case 0x095E: a = 0x092B; b = 0x093C; return true;
+        case 0x095F: a = 0x092F; b = 0x093C; return true;
+        case 0x09DC: a = 0x09A1; b = 0x09BC; return true;
+        case 0x09DD: a = 0x09A2; b = 0x09BC; return true;
+        case 0x09DF: a = 0x09AF; b = 0x09BC; return true;
+        case 0x0A33: a = 0x0A32; b = 0x0A3C; return true;
+        case 0x0A36: a = 0x0A38; b = 0x0A3C; return true;
+        case 0x0A59: a = 0x0A16; b = 0x0A3C; return true;
+        case 0x0A5A: a = 0x0A17; b = 0x0A3C; return true;
+        case 0x0A5B: a = 0x0A1C; b = 0x0A3C; return true;
+        case 0x0A5E: a = 0x0A2B; b = 0x0A3C; return true;
+        case 0x0B5C: a = 0x0B21; b = 0x0B3C; return true;
+        case 0x0B5D: a = 0x0B22; b = 0x0B3C; return true;
+        default: return false;
+    }
+}
+
+static std::string borno_normalize(const std::string & text) {
+    auto cpts = unicode_cpts_from_utf8(text);
+
+    {
+        std::vector<uint32_t> expanded;
+        expanded.reserve(cpts.size());
+        uint32_t a = 0;
+        uint32_t b = 0;
+        for (const uint32_t cpt : cpts) {
+            if (borno_nfc_decompose(cpt, a, b)) {
+                expanded.push_back(a);
+                expanded.push_back(b);
+            } else {
+                expanded.push_back(cpt);
+            }
+        }
+        cpts = std::move(expanded);
+    }
+
+    std::string out;
+    std::string cur;
+    out.reserve(text.size() + text.size() / 4);
+
+    auto flush = [&]() {
+        if (!cur.empty()) {
+            out += ' ';
+            out += cur;
+            cur.clear();
+        }
+    };
+
+    // HF's Punctuation(Isolated) tests `char::is_ascii_punctuation() || is_unicode_punctuation()`.
+    // The ASCII half is WIDER than \p{P}: it also covers $ + < = > ^ ` | ~, which Unicode files
+    // under \p{S}. Missing them mis-splits things like "$20$%".
+    auto is_ascii_punct = [](uint32_t c) {
+        return (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) ||
+               (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
+    };
+
+    for (const uint32_t cpt : cpts) {
+        const auto flags = unicode_cpt_flags_from_cpt(cpt);
+        if (flags.is_whitespace) {
+            flush();
+        } else if (flags.is_punctuation || is_ascii_punct(cpt)) {
+            flush();
+            out += ' ';
+            out += unicode_cpt_to_utf8(cpt);
+        } else {
+            cur += unicode_cpt_to_utf8(cpt);
+        }
+    }
+    flush();
+
+    return out;
+}
+
 struct llm_tokenizer_bpe_session {
     llm_tokenizer_bpe_session(const llama_vocab & vocab, const llm_tokenizer_bpe & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
 
@@ -602,10 +709,18 @@ struct llm_tokenizer_bpe_session {
 
     virtual void tokenize(const std::string & text, std::vector<llama_token> & output) {
         int final_prev_index = -1;
-        const auto word_collection = unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
+
+        auto tok_pre = vocab.get_pre_type();
+
+        std::string borno_text;
+        if (tok_pre == LLAMA_VOCAB_PRE_TYPE_BORNO) {
+            borno_text = borno_normalize(text);
+        }
+        const std::string & split_text = (tok_pre == LLAMA_VOCAB_PRE_TYPE_BORNO) ? borno_text : text;
+
+        const auto word_collection = unicode_regex_split(split_text, tokenizer.regex_exprs, tokenizer.byte_encode);
 
         symbols_final.clear();
-        auto tok_pre = vocab.get_pre_type();
 
         for (const auto & word : word_collection) {
             work_queue = llm_bigram_bpe::queue();
@@ -2168,6 +2283,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             } else if (
                     tokenizer_pre == "deepseek-v3") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM;
+                clean_spaces = false;
+            } else if (
+                    tokenizer_pre == "borno") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_BORNO;
                 clean_spaces = false;
             } else if (
                     tokenizer_pre == "youtu") {

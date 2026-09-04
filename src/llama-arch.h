@@ -159,6 +159,7 @@ enum llm_arch {
     LLM_ARCH_QWEN3TTS,
     LLM_ARCH_POCKETTTS,
     LLM_ARCH_MINIMAX_01,
+    LLM_ARCH_NOOR,
     LLM_ARCH_UNKNOWN,
 };
 

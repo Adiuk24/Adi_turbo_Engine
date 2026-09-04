@@ -2524,6 +2524,38 @@ struct llama_model_kimi_linear : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// Noor-Edge: 24-layer Gated-DeltaNet(18)/GQA(6) 3:1 hybrid + MoE (noor_hybrid/mac_infer.py
+// is the oracle this mirrors; see noor_hybrid/convert_noor_gguf.py for the checkpoint ->
+// GGUF tensor repacking this graph assumes).
+struct llama_model_noor : public llama_model_base {
+    llama_model_noor(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_layer_attn(
+            llm_graph_input_attn_kv * inp_attn,
+                        ggml_tensor * cur,
+                        ggml_tensor * inp_pos,
+                                int   il);
+
+        ggml_tensor * build_layer_delta_net(
+                 llm_graph_input_rs * inp,
+                        ggml_tensor * cur,
+                                int   il);
+
+        ggml_tensor * build_layer_ffn(
+                        ggml_tensor * cur,
+                                int   il);
+
+        const llama_model & model;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 
 struct llama_model_step35 : public llama_model_base {
     llama_model_step35(const struct llama_model_params & params) : llama_model_base(params) {}
