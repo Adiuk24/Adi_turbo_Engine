@@ -2715,6 +2715,9 @@ kernel void kernel_gated_delta_net_impl(
 #define G   FC_gated_delta_net_ne30
 #define K   FC_gated_delta_net_K
 
+    // S_k: key/query head dim (rectangular state row length); == S_v for square-state archs.
+    const uint S_k = args.ne00;
+
     const uint tx = tpitg.x;
     const uint ty = tpitg.y;
 
@@ -2725,11 +2728,11 @@ kernel void kernel_gated_delta_net_impl(
     const uint i01 = i21 % args.ne01;
     const uint i11 = i21 % args.ne11;
 
-    const float scale = 1.0f / sqrt((float)S_v);
+    const float scale = 1.0f / sqrt((float)S_k);
 
-    // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
-    // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
-    const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    // input state layout [S_k, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
+    // state is stored transposed: M[i20][is] = S[is][i20], so row i20 (length S_k) is contiguous
+    const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_k + i20*S_k;
     device const float * s_ptr = (device const float *) (s) + state_in_base;
 
     float ls[NSG];
@@ -2753,10 +2756,10 @@ kernel void kernel_gated_delta_net_impl(
 
     // output state base offset: after attention scores
     const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
-    // output state per-slot size: S_v * S_v * H * n_seqs
-    const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
+    // output state per-slot size: S_k * S_v * H * n_seqs
+    const uint state_size_per_snap = S_v * S_k * args.ne21 * args.ne23;
     // per-(seq,head) offset within a slot
-    const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_k + i20*S_k;
 
     for (short t = 0; t < args.ne22; t++) {
         float s_k = 0.0f;
@@ -2857,6 +2860,9 @@ kernel void kernel_gated_delta_net_impl(
 #define S_v FC_gated_delta_net_ne20
 #define G   FC_gated_delta_net_ne30
 
+    // S_k: key/query head dim (rectangular state row length); == S_v for square-state archs.
+    const uint S_k = args.ne00;
+
     const uint tx = tpitg.x;
     const uint ty = tpitg.y;
 
@@ -2867,15 +2873,15 @@ kernel void kernel_gated_delta_net_impl(
     const uint i01 = i21 % args.ne01;
     const uint i11 = i21 % args.ne11;
 
-    const float scale = 1.0f / sqrt((float)S_v);
+    const float scale = 1.0f / sqrt((float)S_k);
 
-    device const float * s_ptr = (device const float *) (s) + (i23*args.ne21 + i21)*S_v*S_v + i20;
+    device const float * s_ptr = (device const float *) (s) + (i23*args.ne21 + i21)*S_v*S_k + i20;
 
     float lsf[NSG];
 
     FOR_UNROLL (short j = 0; j < NSG; j++) {
         const short is = tx*NSG + j;
-        lsf[j] = s_ptr[is*S_v];
+        lsf[j] = s_ptr[is*S_k];
     }
 
     thread T * ls = (thread T *) (lsf);
@@ -2923,12 +2929,12 @@ kernel void kernel_gated_delta_net_impl(
         dst_attn += args.ne21*S_v;
     }
 
-    device float * dst_state  = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_v + i20;
+    device float * dst_state  = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_k + i20;
     device T     * dstt_state = (device T     *) (dst_state);
 
     FOR_UNROLL (short j = 0; j < NSG; j++) {
         const short is = tx*NSG + j;
-        dst_state[is*S_v] = lsf[j];
+        dst_state[is*S_k] = lsf[j];
     }
 
 #undef S_v
