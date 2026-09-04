@@ -1,0 +1,1229 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# AdiTurbo CLI
+# Product: AdiTurbo
+# Stack: Weights + KV + Runtime
+ADITURBO_VERSION="0.2.0"
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "${SOURCE_PATH}" ]]; do
+    SOURCE_DIR="$(cd -P "$(dirname "${SOURCE_PATH}")" && pwd)"
+    SOURCE_LINK="$(readlink "${SOURCE_PATH}")"
+    if [[ "${SOURCE_LINK}" != /* ]]; then
+        SOURCE_PATH="${SOURCE_DIR}/${SOURCE_LINK}"
+    else
+        SOURCE_PATH="${SOURCE_LINK}"
+    fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SOURCE_PATH}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BUILD_DIR="${ADITURBO_BUILD_DIR:-${ROOT_DIR}/build}"
+BIN_DIR="${BUILD_DIR}/bin"
+PYTHON_BIN="${ADITURBO_PYTHON:-python3}"
+
+log() {
+    printf '[aditurbo] %s\n' "$*"
+}
+
+warn() {
+    printf '[aditurbo][warn] %s\n' "$*" >&2
+}
+
+die() {
+    printf '[aditurbo][error] %s\n' "$*" >&2
+    exit 1
+}
+
+detect_parallelism() {
+    if command -v sysctl >/dev/null 2>&1; then
+        sysctl -n hw.ncpu 2>/dev/null || echo 8
+        return
+    fi
+    if command -v nproc >/dev/null 2>&1; then
+        nproc
+        return
+    fi
+    echo 8
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+require_file() {
+    [[ -f "$1" ]] || die "file not found: $1"
+}
+
+require_dir() {
+    [[ -d "$1" ]] || die "directory not found: $1"
+}
+
+require_bin() {
+    [[ -x "$1" ]] || die "binary not found (run 'aditurbo install'): $1"
+}
+
+default_dataset_path() {
+    if [[ -f "${ROOT_DIR}/../wikitext-2-raw/wiki.test.raw" ]]; then
+        printf '%s\n' "${ROOT_DIR}/../wikitext-2-raw/wiki.test.raw"
+        return
+    fi
+    if [[ -f "${ROOT_DIR}/wikitext-2-raw/wiki.test.raw" ]]; then
+        printf '%s\n' "${ROOT_DIR}/wikitext-2-raw/wiki.test.raw"
+        return
+    fi
+    printf '%s\n' "${ROOT_DIR}/../wikitext-2-raw/wiki.test.raw"
+}
+
+print_main_help() {
+    cat <<EOF
+AdiTurbo CLI (Adi CCP)
+Usage:
+  aditurbo <command> [options]
+  adi-ccp  <command> [options]
+
+Commands:
+  install   Build required binaries and optionally link CLI to PATH
+  info      Inspect GGUF model metadata and quantization compatibility
+  convert   Convert HF->F16->quantized GGUF (or F16->quantized directly)
+  run       Run model inference with sane defaults
+  ui        Launch AdiTurbo local chat UI (Ollama-style)
+  bench     Run standardized throughput benchmark
+  test      Run coherence + perplexity gate checks
+  package   Build distributable tarball for deployment
+  help      Show this help
+
+Examples:
+  aditurbo install --link-dir "\$HOME/.local/bin"
+  aditurbo info --model /path/model.gguf
+  aditurbo convert --f16 /path/model-F16.gguf --type TQ3_0 --out /path/model-TQ3_0.gguf
+  aditurbo run --model /path/model.gguf --prompt "The capital of France is"
+  aditurbo ui --model /path/model.gguf
+  aditurbo bench --model /path/model.gguf
+  aditurbo test --model /path/model.gguf --baseline /path/baseline.gguf
+  aditurbo package --output-dir /tmp
+EOF
+}
+
+print_install_help() {
+    cat <<EOF
+Usage: aditurbo install [options]
+
+Options:
+  --build-dir <path>    Build directory (default: ${BUILD_DIR})
+  --build-type <type>   CMake build type (default: Release)
+  --parallel <n>        Build parallelism (default: auto)
+  --link-dir <path>     Link aditurbo into this dir (default: ~/.local/bin)
+  --no-link             Skip symlink creation
+  --no-build            Skip compile step (link only)
+  -h, --help            Show help
+EOF
+}
+
+print_info_help() {
+    cat <<EOF
+Usage: aditurbo info --model <path/to/model.gguf>
+EOF
+}
+
+print_convert_help() {
+    cat <<EOF
+Usage: aditurbo convert [options]
+
+Input source (choose one):
+  --f16 <path>          Source F16/BF16 GGUF
+  --hf-dir <path>       Local HuggingFace model directory
+  --hf-repo <id>        HuggingFace repo id to download first
+
+Options:
+  --hf-local-dir <path> Download directory for --hf-repo
+  --f16-out <path>      Output path for generated F16 GGUF
+  --out <path>          Output path for quantized GGUF
+  --type <qtype>        Quant type (default: TQ3_0)
+  --imatrix <path>      Existing imatrix file
+  --calibration <file>  Text dataset to generate imatrix automatically
+  --chunks <n>          Imatrix chunks (default: 20)
+  --ctx <n>             Imatrix ctx size (default: 512)
+  --threads <n>         Threads for imatrix (default: auto)
+  --ngl <n>             GPU layers for imatrix (default: 99)
+  --force               Skip source-type guard
+  -h, --help            Show help
+EOF
+}
+
+print_run_help() {
+    cat <<EOF
+Usage: aditurbo run --model <path> [options]
+
+Options:
+  --model <path>        GGUF model path (required)
+  --prompt <text>       Single-turn prompt (if omitted, interactive mode)
+  --ctx <n>             Context size (default: 4096)
+  --predict <n>         Tokens to predict (default: 128)
+  --threads <n>         CPU threads (default: auto)
+  --batch <n>           Batch size (default: 512)
+  --ubatch <n>          UBatch size (default: 512)
+  --ngl <n>             GPU layers (default: 99)
+  --cpu                 Force CPU mode (sets --device none -ngl 0)
+  --temp <v>            Sampling temperature (default: 0.7)
+  --seed <n>            Seed (default: 1)
+  --turbo-kv            Enable AdiTurbo KV runtime path
+  --qjl                 Enable turbo-kv qjl path
+  --proj-dim <n>        turbo-kv projection dim (default: 64)
+  --ctk <type>          KV K cache type (default with --turbo-kv: q8_0)
+  --ctv <type>          KV V cache type (default with --turbo-kv: f16)
+  --                    Pass remaining args directly to llama-cli
+  -h, --help            Show help
+EOF
+}
+
+print_bench_help() {
+    cat <<EOF
+Usage: aditurbo bench --model <path> [options]
+
+Options:
+  --model <path>        GGUF model path (required)
+  --repeats <n>         Repeats (default: 3)
+  --pp <n>              Prompt tokens (default: 512)
+  --tg <n>              Generation tokens (default: 128)
+  --threads <n>         CPU threads (default: auto)
+  --batch <n>           Batch size (default: 512)
+  --ubatch <n>          UBatch size (default: 512)
+  --ngl <n>             GPU layers (default: 99)
+  --cpu                 Force CPU mode
+  --turbo-kv            Enable AdiTurbo KV runtime path
+  --qjl                 Enable turbo-kv qjl path
+  --proj-dim <n>        turbo-kv projection dim (default: 64)
+  --ctk <type>          KV K cache type (default with --turbo-kv: q8_0)
+  --ctv <type>          KV V cache type (default with --turbo-kv: f16)
+  --                    Pass remaining args directly to llama-bench
+  -h, --help            Show help
+EOF
+}
+
+print_ui_help() {
+    cat <<EOF
+Usage: aditurbo ui --model <path> [options]
+
+Options:
+  --model <path>        GGUF model path (required)
+  --host <ip>           API host bind (default: 127.0.0.1)
+  --api-port <port>     API port for llama-server (default: 11434)
+  --ui-host <ip>        UI host bind (default: 127.0.0.1)
+  --ui-port <port>      UI port for browser UI (default: 8080)
+  --ctx <n>             Context size (default: 4096)
+  --threads <n>         CPU threads (default: auto)
+  --batch <n>           Batch size (default: 512)
+  --ubatch <n>          UBatch size (default: 512)
+  --ngl <n>             GPU layers (default: 99)
+  --cpu                 Force CPU mode
+  --turbo-kv            Enable AdiTurbo KV runtime path
+  --qjl                 Enable turbo-kv qjl path
+  --proj-dim <n>        turbo-kv projection dim (default: 64)
+  --ctk <type>          KV K cache type (default with --turbo-kv: q8_0)
+  --ctv <type>          KV V cache type (default with --turbo-kv: f16)
+  --no-open             Do not auto-open browser
+  --                    Pass remaining args directly to llama-server
+  -h, --help            Show help
+EOF
+}
+
+print_test_help() {
+    cat <<EOF
+Usage: aditurbo test --model <path> [options]
+
+Options:
+  --model <path>        GGUF model path (required)
+  --baseline <path>     Baseline model for PPL delta comparison
+  --dataset <file>      Evaluation dataset (default: $(default_dataset_path))
+  --chunks <n>          PPL chunks (default: 5)
+  --ctx <n>             Context size for coherence test (default: 512)
+  --max-delta-pct <v>   Max allowed PPL delta percent vs baseline (default: 5.0)
+  --ngl <n>             GPU layers (default: 99)
+  --cpu                 Force CPU mode
+  -h, --help            Show help
+EOF
+}
+
+run_ui() {
+    local model=""
+    local host="127.0.0.1"
+    local api_port=11434
+    local ui_host="127.0.0.1"
+    local ui_port=8080
+    local ctx=4096
+    local threads
+    threads="$(detect_parallelism)"
+    local batch=512
+    local ubatch=512
+    local ngl=99
+    local cpu_mode=0
+    local turbo_kv=0
+    local turbo_qjl=0
+    local proj_dim=64
+    local ctk=""
+    local ctv=""
+    local auto_open=1
+    local extra_args=()
+    local ui_file="${ROOT_DIR}/scripts/aditurbo-ui.html"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m) model="$2"; shift 2 ;;
+            --host) host="$2"; shift 2 ;;
+            --api-port) api_port="$2"; shift 2 ;;
+            --ui-host) ui_host="$2"; shift 2 ;;
+            --ui-port) ui_port="$2"; shift 2 ;;
+            --ctx) ctx="$2"; shift 2 ;;
+            --threads|-t) threads="$2"; shift 2 ;;
+            --batch|-b) batch="$2"; shift 2 ;;
+            --ubatch|-ub) ubatch="$2"; shift 2 ;;
+            --ngl) ngl="$2"; shift 2 ;;
+            --cpu) cpu_mode=1; shift ;;
+            --turbo-kv) turbo_kv=1; shift ;;
+            --qjl) turbo_qjl=1; shift ;;
+            --proj-dim) proj_dim="$2"; shift 2 ;;
+            --ctk) ctk="$2"; shift 2 ;;
+            --ctv) ctv="$2"; shift 2 ;;
+            --no-open) auto_open=0; shift ;;
+            --) shift; extra_args+=("$@"); break ;;
+            -h|--help) print_ui_help; return 0 ;;
+            *) die "unknown ui option: $1" ;;
+        esac
+    done
+
+    [[ -n "${model}" ]] || die "ui requires --model"
+    require_file "${model}"
+    require_bin "${BIN_DIR}/llama-server"
+    require_file "${ui_file}"
+    require_cmd "${PYTHON_BIN}"
+
+    if [[ "${turbo_kv}" -eq 1 ]]; then
+        [[ -n "${ctk}" ]] || ctk="q8_0"
+        [[ -n "${ctv}" ]] || ctv="f16"
+    fi
+
+    local ui_root="${ROOT_DIR}/scripts"
+    local run_root=""
+    run_root="$(mktemp -d "${TMPDIR:-/tmp}/aditurbo-ui.XXXXXX")"
+
+    local server_log="${run_root}/llama-server.log"
+    local web_log="${run_root}/aditurbo-web.log"
+
+    local server_cmd=("${BIN_DIR}/llama-server" -m "${model}" --host "${host}" --port "${api_port}" -c "${ctx}" -t "${threads}" -b "${batch}" -ub "${ubatch}")
+    if [[ "${cpu_mode}" -eq 1 ]]; then
+        server_cmd+=(--device none -ngl 0)
+    else
+        server_cmd+=(-ngl "${ngl}")
+    fi
+    if [[ "${turbo_kv}" -eq 1 ]]; then
+        local server_help=""
+        server_help="$("${BIN_DIR}/llama-server" --help 2>&1 || true)"
+        if grep -q -- "--turbo-kv" <<<"${server_help}"; then
+            server_cmd+=(--turbo-kv --turbo-kv-proj-dim "${proj_dim}" -ctk "${ctk}" -ctv "${ctv}")
+            if [[ "${turbo_qjl}" -eq 1 ]]; then
+                if grep -q -- "--turbo-kv-qjl" <<<"${server_help}"; then
+                    server_cmd+=(--turbo-kv-qjl)
+                else
+                    warn "llama-server does not support --turbo-kv-qjl; launching without qjl"
+                fi
+            fi
+        else
+            warn "llama-server does not support --turbo-kv flags; launching UI without turbo-kv"
+        fi
+    fi
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        server_cmd+=("${extra_args[@]}")
+    fi
+
+    "${server_cmd[@]}" >"${server_log}" 2>&1 &
+    local server_pid="$!"
+
+    cleanup_ui() {
+        if [[ -n "${server_pid:-}" ]] && kill -0 "${server_pid}" >/dev/null 2>&1; then
+            kill "${server_pid}" >/dev/null 2>&1 || true
+        fi
+        if [[ -n "${web_pid:-}" ]] && kill -0 "${web_pid}" >/dev/null 2>&1; then
+            kill "${web_pid}" >/dev/null 2>&1 || true
+        fi
+        rm -rf "${run_root}" >/dev/null 2>&1 || true
+    }
+    trap cleanup_ui EXIT INT TERM
+
+    local ready=0
+    local i
+    for i in $(seq 1 60); do
+        if curl -sSf "http://${host}:${api_port}/v1/models" >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        if ! kill -0 "${server_pid}" >/dev/null 2>&1; then
+            warn "llama-server exited early; showing logs"
+            tail -n 60 "${server_log}" >&2 || true
+            return 1
+        fi
+        sleep 0.5
+    done
+    if [[ "${ready}" -ne 1 ]]; then
+        warn "API readiness timed out; continuing"
+    fi
+
+    # Per-session token: POST endpoints require it, blocking CSRF from other
+    # origins (a malicious page can hit 127.0.0.1 but cannot read the token).
+    local ui_token=""
+    ui_token="$(openssl rand -hex 16 2>/dev/null || od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+
+    # The session token is carried in the launch URL; for a local bind it never
+    # leaves the machine, but on a non-local bind it can land in proxy/access
+    # logs or browser history. Warn so the user can prefer an SSH tunnel.
+    if [[ "${ui_host}" != "127.0.0.1" && "${ui_host}" != "localhost" ]]; then
+        warn "binding UI to non-local host ${ui_host}: the session token travels in the URL and may be logged. Prefer 127.0.0.1 + an SSH tunnel for remote access."
+    fi
+
+    "${PYTHON_BIN}" - "${ui_root}" "${ui_host}" "${ui_port}" "${ROOT_DIR}/scripts/aditurbo" "${ui_token}" >"${web_log}" 2>&1 <<'PY' &
+import http.server
+import json
+import os
+import socketserver
+import subprocess
+import sys
+
+UI_ROOT = sys.argv[1]
+HOST = sys.argv[2]
+PORT = int(sys.argv[3])
+ADITURBO = sys.argv[4]
+TOKEN = sys.argv[5]
+
+ALLOWED_SOURCE_MODE = {"f16", "hf-dir", "hf-repo"}
+ALLOWED_TYPES = {"TQ1_0", "TQ2_0", "TQ3_0", "TQ4_0"}
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=UI_ROOT, **kwargs)
+
+    def _json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/api/health":
+            self._json(200, {"ok": True, "service": "aditurbo-ui"})
+            return
+        super().do_GET()
+
+    def _authorized(self):
+        # Reject cross-origin requests: browsers always send Origin on
+        # cross-site POST; same-page fetches send our own origin or nothing.
+        origin = self.headers.get("Origin", "")
+        # When bound to a wildcard address the set of valid origins (the machine's
+        # real IPs) can't be enumerated, and the browser sends the accessed IP as
+        # Origin — so skip the allowlist there and rely on the unguessable token
+        # (the actual CSRF defense). For a fixed host, exact-match the allowlist.
+        if origin and HOST not in ("0.0.0.0", "::"):
+            allowed = {f"http://{HOST}:{PORT}", f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
+            if origin not in allowed:
+                return False
+        # Require the per-session token (delivered via the launch URL).
+        return self.headers.get("X-AdiTurbo-Token", "") == TOKEN
+
+    def do_POST(self):
+        if not self._authorized():
+            self._json(403, {"ok": False, "error": "forbidden"})
+            return
+        if self.path != "/api/convert":
+            self._json(404, {"ok": False, "error": "not_found"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(min(length, 128 * 1024))
+            req = json.loads(raw.decode("utf-8") or "{}")
+        except Exception as e:
+            self._json(400, {"ok": False, "error": f"invalid_json: {e}"})
+            return
+
+        source_mode = str(req.get("source_mode", "f16")).strip().lower()
+        source = str(req.get("source", "")).strip()
+        out = str(req.get("out", "")).strip()
+        qtype = str(req.get("type", "TQ3_0")).strip().upper()
+        imatrix = str(req.get("imatrix", "")).strip()
+        calibration = str(req.get("calibration", "")).strip()
+
+        if source_mode not in ALLOWED_SOURCE_MODE:
+            self._json(400, {"ok": False, "error": "invalid_source_mode"})
+            return
+        if qtype not in ALLOWED_TYPES:
+            self._json(400, {"ok": False, "error": "invalid_quant_type"})
+            return
+        if not source:
+            self._json(400, {"ok": False, "error": "source_required"})
+            return
+        if not out:
+            self._json(400, {"ok": False, "error": "out_required"})
+            return
+
+        cmd = [ADITURBO, "convert"]
+        if source_mode == "f16":
+            cmd += ["--f16", source]
+        elif source_mode == "hf-dir":
+            cmd += ["--hf-dir", source]
+        else:
+            cmd += ["--hf-repo", source]
+
+        cmd += ["--type", qtype, "--out", out]
+        if imatrix:
+            cmd += ["--imatrix", imatrix]
+        if calibration:
+            cmd += ["--calibration", calibration]
+
+        proc = subprocess.run(cmd, text=True, capture_output=True)
+        self._json(200, {
+            "ok": proc.returncode == 0,
+            "command": cmd,
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout[-20000:],
+            "stderr": proc.stderr[-20000:],
+        })
+
+class ThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+with ThreadingServer((HOST, PORT), Handler) as httpd:
+    httpd.serve_forever()
+PY
+    local web_pid="$!"
+
+    local web_ready=0
+    local web_path="/aditurbo-ui.html"
+    for i in $(seq 1 40); do
+        if curl -sSf "http://${ui_host}:${ui_port}${web_path}" >/dev/null 2>&1; then
+            web_ready=1
+            break
+        fi
+        if ! kill -0 "${web_pid}" >/dev/null 2>&1; then
+            warn "UI web server failed to start; showing logs"
+            tail -n 60 "${web_log}" >&2 || true
+            return 1
+        fi
+        sleep 0.2
+    done
+    if [[ "${web_ready}" -ne 1 ]]; then
+        warn "UI web server did not become ready on ${ui_host}:${ui_port}"
+    fi
+
+    local ui_url="http://${ui_host}:${ui_port}/aditurbo-ui.html?api=http://${host}:${api_port}&model=$(basename "${model}")&token=${ui_token}"
+    log "API: http://${host}:${api_port}"
+    log "UI:  ${ui_url}"
+    log "Press Ctrl+C to stop."
+
+    if [[ "${auto_open}" -eq 1 ]]; then
+        if command -v open >/dev/null 2>&1; then
+            open "${ui_url}" >/dev/null 2>&1 || true
+        elif command -v xdg-open >/dev/null 2>&1; then
+            xdg-open "${ui_url}" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    wait "${server_pid}"
+}
+
+print_package_help() {
+    cat <<EOF
+Usage: aditurbo package [options]
+
+Options:
+  --output-dir <path>   Output directory (default: ${ROOT_DIR}/dist)
+  --name <name>         Bundle base name (default: auto)
+  --build-dir <path>    Build directory (default: ${BUILD_DIR})
+  --build-type <type>   CMake build type (default: Release)
+  --parallel <n>        Build parallelism (default: auto)
+  --no-build            Skip build step
+  -h, --help            Show help
+EOF
+}
+
+run_install() {
+    local build_type="Release"
+    local parallel
+    parallel="$(detect_parallelism)"
+    local link_dir="${HOME}/.local/bin"
+    local do_link=1
+    local do_build=1
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --build-dir) BUILD_DIR="$2"; BIN_DIR="${BUILD_DIR}/bin"; shift 2 ;;
+            --build-type) build_type="$2"; shift 2 ;;
+            --parallel) parallel="$2"; shift 2 ;;
+            --link-dir) link_dir="$2"; shift 2 ;;
+            --no-link) do_link=0; shift ;;
+            --no-build) do_build=0; shift ;;
+            -h|--help) print_install_help; return 0 ;;
+            *) die "unknown install option: $1" ;;
+        esac
+    done
+
+    require_cmd cmake
+
+    if [[ "$do_build" -eq 1 ]]; then
+        log "configuring build dir: ${BUILD_DIR}"
+        cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${build_type}"
+        log "building required binaries"
+        cmake --build "${BUILD_DIR}" --target llama-cli llama-server llama-quantize llama-bench llama-perplexity llama-imatrix --parallel "${parallel}"
+    fi
+
+    if [[ "$do_link" -eq 1 ]]; then
+        mkdir -p "${link_dir}"
+        ln -sf "${ROOT_DIR}/scripts/aditurbo" "${link_dir}/aditurbo"
+        ln -sf "${ROOT_DIR}/scripts/aditurbo" "${link_dir}/adi-ccp"
+        log "linked: ${link_dir}/aditurbo -> ${ROOT_DIR}/scripts/aditurbo"
+        log "linked: ${link_dir}/adi-ccp -> ${ROOT_DIR}/scripts/aditurbo"
+        if [[ ":$PATH:" != *":${link_dir}:"* ]]; then
+            warn "${link_dir} is not in PATH. Add: export PATH=\"${link_dir}:\$PATH\""
+        fi
+    fi
+
+    log "install complete"
+}
+
+run_info() {
+    local model=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m) model="$2"; shift 2 ;;
+            -h|--help) print_info_help; return 0 ;;
+            *) die "unknown info option: $1" ;;
+        esac
+    done
+
+    [[ -n "${model}" ]] || die "info requires --model"
+    require_file "${model}"
+    require_file "${ROOT_DIR}/gguf-py/gguf/__init__.py"
+    require_cmd "${PYTHON_BIN}"
+
+    "${PYTHON_BIN}" - "${ROOT_DIR}/gguf-py" "${model}" <<'PY'
+import collections
+import os
+import sys
+
+gguf_py, model = sys.argv[1], sys.argv[2]
+sys.path.insert(0, gguf_py)
+from gguf import GGUFReader
+
+r = GGUFReader(model)
+
+def read_field(key):
+    f = r.fields.get(key)
+    if not f or not f.parts:
+        return None
+    val = f.parts[-1]
+    try:
+        if hasattr(val, "tolist"):
+            val = val.tolist()
+    except Exception:
+        pass
+    if isinstance(val, (list, tuple)) and len(val) == 1:
+        val = val[0]
+    if isinstance(val, list) and val and all(isinstance(x, int) and 0 <= x <= 255 for x in val):
+        try:
+            val = bytes(val).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    if isinstance(val, bytes):
+        val = val.decode("utf-8", errors="ignore")
+    return val
+
+arch = read_field("general.architecture")
+file_type = read_field("general.file_type")
+name = read_field("general.name")
+size_bytes = os.path.getsize(model)
+type_counts = collections.Counter(t.tensor_type.name for t in r.tensors)
+
+n_embd = None
+if isinstance(arch, str):
+    n_embd = read_field(f"{arch}.embedding_length")
+
+print(f"model: {model}")
+if name is not None:
+    print(f"name: {name}")
+if arch is not None:
+    print(f"arch: {arch}")
+if file_type is not None:
+    print(f"file_type: {file_type}")
+print(f"size_gib: {size_bytes / (1024**3):.2f}")
+print(f"tensor_count: {len(r.tensors)}")
+print("tensor_types:")
+for k, v in sorted(type_counts.items()):
+    print(f"  {k}: {v}")
+
+if isinstance(n_embd, int):
+    print(f"n_embd: {n_embd}")
+    print(f"tq3_block_compat: {'yes' if n_embd % 256 == 0 else 'no'}")
+else:
+    print("n_embd: unknown")
+
+misaligned = 0
+for t in r.tensors:
+    try:
+        if len(t.shape) >= 2 and int(t.shape[0]) % 256 != 0:
+            misaligned += 1
+    except Exception:
+        pass
+print(f"tensor_ne0_not_div_256: {misaligned}")
+PY
+}
+
+assert_source_is_f16_like() {
+    local model="$1"
+    local force="${2:-0}"
+    if [[ "${force}" == "1" ]]; then
+        return 0
+    fi
+
+    local file_type
+    file_type="$("${PYTHON_BIN}" - "${ROOT_DIR}/gguf-py" "${model}" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from gguf import GGUFReader
+r = GGUFReader(sys.argv[2])
+f = r.fields.get("general.file_type")
+v = None
+if f and f.parts:
+    v = f.parts[-1]
+    if hasattr(v, "tolist"):
+        v = v.tolist()
+    if isinstance(v, (list, tuple)) and len(v) == 1:
+        v = v[0]
+print(v if v is not None else "")
+PY
+)"
+
+    # GGUF file_type: 1=f16, 32=bf16 in current forks; allow unknown if filename suggests F16/BF16.
+    if [[ "${file_type}" == "1" || "${file_type}" == "32" ]]; then
+        return 0
+    fi
+    if [[ "${model}" == *F16.gguf || "${model}" == *f16.gguf || "${model}" == *BF16.gguf || "${model}" == *bf16.gguf ]]; then
+        warn "general.file_type='${file_type}' but filename looks F16/BF16; continuing"
+        return 0
+    fi
+    die "source model does not look like F16/BF16 GGUF (use --force to override): ${model}"
+}
+
+run_convert() {
+    local f16_model=""
+    local hf_dir=""
+    local hf_repo=""
+    local hf_local_dir=""
+    local f16_out=""
+    local out_model=""
+    local quant_type="TQ3_0"
+    local imatrix=""
+    local calibration=""
+    local chunks=20
+    local ctx=512
+    local threads
+    threads="$(detect_parallelism)"
+    local ngl=99
+    local force=0
+    local embed_type="q6_k"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --f16) f16_model="$2"; shift 2 ;;
+            --hf-dir) hf_dir="$2"; shift 2 ;;
+            --hf-repo) hf_repo="$2"; shift 2 ;;
+            --hf-local-dir) hf_local_dir="$2"; shift 2 ;;
+            --f16-out) f16_out="$2"; shift 2 ;;
+            --out) out_model="$2"; shift 2 ;;
+            --type) quant_type="$2"; shift 2 ;;
+            --imatrix) imatrix="$2"; shift 2 ;;
+            --calibration) calibration="$2"; shift 2 ;;
+            --chunks) chunks="$2"; shift 2 ;;
+            --ctx) ctx="$2"; shift 2 ;;
+            --threads) threads="$2"; shift 2 ;;
+            --ngl) ngl="$2"; shift 2 ;;
+            --embed-type) embed_type="$2"; shift 2 ;;
+            --force) force=1; shift ;;
+            -h|--help) print_convert_help; return 0 ;;
+            *) die "unknown convert option: $1" ;;
+        esac
+    done
+
+    require_cmd "${PYTHON_BIN}"
+    require_file "${ROOT_DIR}/convert_hf_to_gguf.py"
+    require_bin "${BIN_DIR}/llama-quantize"
+
+    if [[ -n "${hf_repo}" ]]; then
+        if [[ -z "${hf_local_dir}" ]]; then
+            hf_local_dir="${ROOT_DIR}/models/${hf_repo//\//--}"
+        fi
+        mkdir -p "${hf_local_dir}"
+        if command -v huggingface-cli >/dev/null 2>&1; then
+            log "downloading HF repo with huggingface-cli: ${hf_repo}"
+            huggingface-cli download "${hf_repo}" --local-dir "${hf_local_dir}" --local-dir-use-symlinks False
+        elif command -v hf >/dev/null 2>&1; then
+            log "downloading HF repo with hf: ${hf_repo}"
+            hf download "${hf_repo}" --local-dir "${hf_local_dir}"
+        else
+            die "HF download requested but neither 'huggingface-cli' nor 'hf' is available"
+        fi
+        hf_dir="${hf_local_dir}"
+    fi
+
+    if [[ -n "${hf_dir}" ]]; then
+        require_dir "${hf_dir}"
+        if [[ -z "${f16_out}" ]]; then
+            local hf_name
+            hf_name="$(basename "${hf_dir}")"
+            f16_out="${ROOT_DIR}/models/${hf_name}-F16.gguf"
+        fi
+        log "converting HF -> F16 GGUF"
+        "${PYTHON_BIN}" "${ROOT_DIR}/convert_hf_to_gguf.py" "${hf_dir}" --outtype f16 --outfile "${f16_out}"
+        f16_model="${f16_out}"
+    fi
+
+    [[ -n "${f16_model}" ]] || die "convert requires --f16 or --hf-dir/--hf-repo"
+    require_file "${f16_model}"
+    assert_source_is_f16_like "${f16_model}" "${force}"
+
+    if [[ -z "${out_model}" ]]; then
+        local base
+        base="${f16_model%.gguf}"
+        base="${base%-F16}"
+        base="${base%-f16}"
+        out_model="${base}-${quant_type}.gguf"
+    fi
+
+    if [[ -z "${imatrix}" && -n "${calibration}" ]]; then
+        require_file "${calibration}"
+        require_bin "${BIN_DIR}/llama-imatrix"
+        imatrix="${f16_model%.gguf}.imatrix.gguf"
+        log "generating imatrix: ${imatrix}"
+        "${BIN_DIR}/llama-imatrix" -m "${f16_model}" -f "${calibration}" --chunks "${chunks}" -c "${ctx}" -ngl "${ngl}" -t "${threads}" -b 256 -ub 256 -o "${imatrix}" --output-format gguf
+    fi
+
+    local qt_upper
+    qt_upper="$(printf '%s' "${quant_type}" | tr '[:lower:]' '[:upper:]')"
+
+    # Classify the requested weight quant type. llama-quantize accepts BOTH names
+    # (TQ3_0) and numeric llama_ftype ids (40), so match both. TQ3_S is excluded:
+    # it is a KV-cache-only format, never a weight quant, and ignores imatrix.
+    #   36=TQ1_0  37=TQ2_0  40=TQ3_0  41=TQ4_0
+    local is_tq_weight=0 is_ternary=0
+    case "${qt_upper}" in
+        TQ1_0|TQ2_0|TQ3_0|TQ4_0) is_tq_weight=1 ;;
+        36|37|40|41)             is_tq_weight=1 ;;
+    esac
+    case "${qt_upper}" in
+        TQ1_0|TQ2_0|36|37)       is_ternary=1 ;;
+    esac
+
+    # Ternary formats encode only {-1,0,+1} per weight. They are near-lossless for
+    # QAT/BitNet-style models trained with ternary weights, but post-training
+    # quantization of a normal model is unusable even WITH an imatrix
+    # (measured: TQ2_0+imatrix PPL ~1400 vs Q2_K+imatrix ~12 on the same model).
+    if [[ "${is_ternary}" -eq 1 ]]; then
+        warn "${quant_type} is a ternary format: only suitable for QAT/BitNet-trained models."
+        warn "Post-training quantization of a standard model WILL produce garbage (use TQ3_0/TQ4_0 instead)."
+    fi
+
+    if [[ -n "${imatrix}" ]]; then
+        require_file "${imatrix}"
+        log "quantizing with imatrix (${quant_type})"
+        "${BIN_DIR}/llama-quantize" --imatrix "${imatrix}" --token-embedding-type "${embed_type}" "${f16_model}" "${out_model}" "${quant_type}"
+    else
+        # TQ (TurboQuant) weight formats are low-bit and depend on an importance
+        # matrix to pick per-block scales. Without one the FFN weights collapse to
+        # ~zero and the model produces garbage (measured PPL ~3300+ vs ~9 with
+        # imatrix). Refuse rather than silently ship a broken model. Pass
+        # --calibration <text> to generate one, --imatrix <file> to supply one, or
+        # --force to override (only sensible for high-bit non-TQ types).
+        if [[ "${is_tq_weight}" -eq 1 && "${force}" != "1" && "${force}" != "true" ]]; then
+            die "refusing to quantize ${quant_type} without an imatrix — it produces a broken model. Provide --calibration <text-file> (auto-generates one) or --imatrix <file>. Use --force to override."
+        fi
+        warn "quantizing without imatrix (${quant_type})"
+        "${BIN_DIR}/llama-quantize" --token-embedding-type "${embed_type}" "${f16_model}" "${out_model}" "${quant_type}"
+    fi
+
+    require_file "${out_model}"
+    log "quantized model: ${out_model}"
+    log "size: $(du -h "${out_model}" | awk '{print $1}')"
+}
+
+run_run() {
+    local model=""
+    local prompt=""
+    local ctx=4096
+    local predict=128
+    local threads
+    threads="$(detect_parallelism)"
+    local batch=512
+    local ubatch=512
+    local ngl=99
+    local cpu_mode=0
+    local turbo_kv=0
+    local turbo_qjl=0
+    local proj_dim=64
+    local ctk=""
+    local ctv=""
+    local temp=0.7
+    local seed=1
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m) model="$2"; shift 2 ;;
+            --prompt|-p) prompt="$2"; shift 2 ;;
+            --ctx) ctx="$2"; shift 2 ;;
+            --predict|--n-predict) predict="$2"; shift 2 ;;
+            --threads|-t) threads="$2"; shift 2 ;;
+            --batch|-b) batch="$2"; shift 2 ;;
+            --ubatch|-ub) ubatch="$2"; shift 2 ;;
+            --ngl) ngl="$2"; shift 2 ;;
+            --cpu) cpu_mode=1; shift ;;
+            --turbo-kv) turbo_kv=1; shift ;;
+            --qjl) turbo_qjl=1; shift ;;
+            --proj-dim) proj_dim="$2"; shift 2 ;;
+            --ctk) ctk="$2"; shift 2 ;;
+            --ctv) ctv="$2"; shift 2 ;;
+            --temp) temp="$2"; shift 2 ;;
+            --seed) seed="$2"; shift 2 ;;
+            --) shift; extra_args+=("$@"); break ;;
+            -h|--help) print_run_help; return 0 ;;
+            *) die "unknown run option: $1" ;;
+        esac
+    done
+
+    [[ -n "${model}" ]] || die "run requires --model"
+    require_file "${model}"
+    require_bin "${BIN_DIR}/llama-cli"
+
+    if [[ "${turbo_kv}" -eq 1 ]]; then
+        [[ -n "${ctk}" ]] || ctk="q8_0"
+        [[ -n "${ctv}" ]] || ctv="f16"
+    fi
+
+    local cmd=("${BIN_DIR}/llama-cli" -m "${model}" -c "${ctx}" -n "${predict}" -t "${threads}" -b "${batch}" -ub "${ubatch}" --temp "${temp}" --seed "${seed}")
+    if [[ "${cpu_mode}" -eq 1 ]]; then
+        cmd+=(--device none -ngl 0)
+    else
+        cmd+=(-ngl "${ngl}")
+    fi
+    if [[ "${turbo_kv}" -eq 1 ]]; then
+        cmd+=(--turbo-kv --turbo-kv-proj-dim "${proj_dim}" -ctk "${ctk}" -ctv "${ctv}")
+        if [[ "${turbo_qjl}" -eq 1 ]]; then
+            cmd+=(--turbo-kv-qjl)
+        fi
+    fi
+    if [[ -n "${prompt}" ]]; then
+        cmd+=(--single-turn --no-display-prompt -p "${prompt}")
+    fi
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        cmd+=("${extra_args[@]}")
+    fi
+
+    log "running llama-cli"
+    "${cmd[@]}"
+}
+
+run_bench() {
+    local model=""
+    local repeats=3
+    local pp=512
+    local tg=128
+    local threads
+    threads="$(detect_parallelism)"
+    local batch=512
+    local ubatch=512
+    local ngl=99
+    local cpu_mode=0
+    local turbo_kv=0
+    local turbo_qjl=0
+    local proj_dim=64
+    local ctk=""
+    local ctv=""
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m) model="$2"; shift 2 ;;
+            --repeats|-r) repeats="$2"; shift 2 ;;
+            --pp|-p) pp="$2"; shift 2 ;;
+            --tg|-n) tg="$2"; shift 2 ;;
+            --threads|-t) threads="$2"; shift 2 ;;
+            --batch|-b) batch="$2"; shift 2 ;;
+            --ubatch|-ub) ubatch="$2"; shift 2 ;;
+            --ngl) ngl="$2"; shift 2 ;;
+            --cpu) cpu_mode=1; shift ;;
+            --turbo-kv) turbo_kv=1; shift ;;
+            --qjl) turbo_qjl=1; shift ;;
+            --proj-dim) proj_dim="$2"; shift 2 ;;
+            --ctk) ctk="$2"; shift 2 ;;
+            --ctv) ctv="$2"; shift 2 ;;
+            --) shift; extra_args+=("$@"); break ;;
+            -h|--help) print_bench_help; return 0 ;;
+            *) die "unknown bench option: $1" ;;
+        esac
+    done
+
+    [[ -n "${model}" ]] || die "bench requires --model"
+    require_file "${model}"
+    require_bin "${BIN_DIR}/llama-bench"
+
+    if [[ "${turbo_kv}" -eq 1 ]]; then
+        [[ -n "${ctk}" ]] || ctk="q8_0"
+        [[ -n "${ctv}" ]] || ctv="f16"
+    fi
+
+    local cmd=("${BIN_DIR}/llama-bench" -m "${model}" -r "${repeats}" -p "${pp}" -n "${tg}" -t "${threads}" -b "${batch}" -ub "${ubatch}")
+    if [[ "${cpu_mode}" -eq 1 ]]; then
+        cmd+=(--device none -ngl 0)
+    else
+        cmd+=(-ngl "${ngl}")
+    fi
+    if [[ "${turbo_kv}" -eq 1 ]]; then
+        cmd+=(--turbo-kv --turbo-kv-proj-dim "${proj_dim}" -ctk "${ctk}" -ctv "${ctv}")
+        if [[ "${turbo_qjl}" -eq 1 ]]; then
+            cmd+=(--turbo-kv-qjl)
+        fi
+    fi
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        cmd+=("${extra_args[@]}")
+    fi
+
+    log "running llama-bench"
+    "${cmd[@]}"
+}
+
+extract_ppl() {
+    local log_file="$1"
+    "${PYTHON_BIN}" - "${log_file}" <<'PY'
+import re
+import sys
+text = open(sys.argv[1], "r", encoding="utf-8", errors="ignore").read()
+m = re.findall(r"Final estimate: PPL =\s*([0-9.]+)", text)
+print(m[-1] if m else "")
+PY
+}
+
+run_test() {
+    local model=""
+    local baseline=""
+    local dataset
+    dataset="$(default_dataset_path)"
+    local chunks=5
+    local ctx=512
+    local max_delta_pct=5.0
+    local ngl=99
+    local cpu_mode=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m) model="$2"; shift 2 ;;
+            --baseline) baseline="$2"; shift 2 ;;
+            --dataset|-f) dataset="$2"; shift 2 ;;
+            --chunks) chunks="$2"; shift 2 ;;
+            --ctx) ctx="$2"; shift 2 ;;
+            --max-delta-pct) max_delta_pct="$2"; shift 2 ;;
+            --ngl) ngl="$2"; shift 2 ;;
+            --cpu) cpu_mode=1; shift ;;
+            -h|--help) print_test_help; return 0 ;;
+            *) die "unknown test option: $1" ;;
+        esac
+    done
+
+    [[ -n "${model}" ]] || die "test requires --model"
+    require_file "${model}"
+    require_bin "${BIN_DIR}/llama-cli"
+    require_bin "${BIN_DIR}/llama-perplexity"
+    require_cmd "${PYTHON_BIN}"
+
+    local ngl_args=()
+    if [[ "${cpu_mode}" -eq 1 ]]; then
+        ngl_args=(--device none -ngl 0)
+    else
+        ngl_args=(-ngl "${ngl}")
+    fi
+
+    log "coherence check"
+    local coherence_out
+    coherence_out="$("${BIN_DIR}/llama-cli" -m "${model}" -c "${ctx}" -n 48 -t "$(detect_parallelism)" -b 256 --single-turn --no-display-prompt --temp 0 "${ngl_args[@]}" -p "The capital of France is" 2>&1 || true)"
+    if [[ "${coherence_out}" != *"Paris"* && "${coherence_out}" != *"paris"* ]]; then
+        warn "coherence check failed (expected response containing 'Paris')"
+        printf '%s\n' "${coherence_out}" | tail -n 10
+        return 2
+    fi
+    log "coherence: PASS"
+
+    if [[ ! -f "${dataset}" ]]; then
+        warn "dataset not found; skipping PPL check: ${dataset}"
+        return 0
+    fi
+
+    local tmp_ppl=""
+    local tmp_base=""
+    tmp_ppl="$(mktemp "${TMPDIR:-/tmp}/aditurbo-ppl.XXXXXX.log")"
+    trap 'rm -f "${tmp_ppl:-}" "${tmp_base:-}"' RETURN
+
+    log "PPL check on model"
+    "${BIN_DIR}/llama-perplexity" -m "${model}" -f "${dataset}" --chunks "${chunks}" -c "${ctx}" -b 256 -ub 256 "${ngl_args[@]}" >"${tmp_ppl}" 2>&1
+    local ppl
+    ppl="$(extract_ppl "${tmp_ppl}")"
+    [[ -n "${ppl}" ]] || die "failed to parse PPL for model ${model}"
+    log "model PPL: ${ppl}"
+
+    if [[ -n "${baseline}" ]]; then
+        require_file "${baseline}"
+        tmp_base="$(mktemp "${TMPDIR:-/tmp}/aditurbo-ppl-base.XXXXXX.log")"
+
+        log "PPL check on baseline"
+        "${BIN_DIR}/llama-perplexity" -m "${baseline}" -f "${dataset}" --chunks "${chunks}" -c "${ctx}" -b 256 -ub 256 "${ngl_args[@]}" >"${tmp_base}" 2>&1
+        local ppl_base
+        ppl_base="$(extract_ppl "${tmp_base}")"
+        [[ -n "${ppl_base}" ]] || die "failed to parse baseline PPL for ${baseline}"
+        log "baseline PPL: ${ppl_base}"
+
+        local delta_pct
+        delta_pct="$("${PYTHON_BIN}" - "${ppl}" "${ppl_base}" <<'PY'
+import sys
+p=float(sys.argv[1]); b=float(sys.argv[2])
+print(((p-b)/b)*100 if b != 0 else 0.0)
+PY
+)"
+        log "PPL delta % vs baseline: ${delta_pct}"
+
+        local pass
+        pass="$("${PYTHON_BIN}" - "${delta_pct}" "${max_delta_pct}" <<'PY'
+import sys
+d=abs(float(sys.argv[1])); t=float(sys.argv[2])
+print("1" if d <= t else "0")
+PY
+)"
+        if [[ "${pass}" != "1" ]]; then
+            warn "PPL gate failed: |delta|=${delta_pct}% > ${max_delta_pct}%"
+            return 3
+        fi
+        log "PPL gate: PASS"
+    fi
+
+    return 0
+}
+
+run_package() {
+    local output_dir="${ROOT_DIR}/dist"
+    local name
+    name="aditurbo-${ADITURBO_VERSION}-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+    local build_type="Release"
+    local parallel
+    parallel="$(detect_parallelism)"
+    local do_build=1
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --output-dir) output_dir="$2"; shift 2 ;;
+            --name) name="$2"; shift 2 ;;
+            --build-dir) BUILD_DIR="$2"; BIN_DIR="${BUILD_DIR}/bin"; shift 2 ;;
+            --build-type) build_type="$2"; shift 2 ;;
+            --parallel) parallel="$2"; shift 2 ;;
+            --no-build) do_build=0; shift ;;
+            -h|--help) print_package_help; return 0 ;;
+            *) die "unknown package option: $1" ;;
+        esac
+    done
+
+    if [[ "${do_build}" -eq 1 ]]; then
+        require_cmd cmake
+        cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${build_type}"
+        cmake --build "${BUILD_DIR}" --target llama-cli llama-server llama-quantize llama-bench llama-perplexity llama-imatrix --parallel "${parallel}"
+    fi
+
+    require_bin "${BIN_DIR}/llama-cli"
+    require_bin "${BIN_DIR}/llama-server"
+    require_bin "${BIN_DIR}/llama-quantize"
+    require_bin "${BIN_DIR}/llama-bench"
+    require_bin "${BIN_DIR}/llama-perplexity"
+    require_bin "${BIN_DIR}/llama-imatrix"
+
+    mkdir -p "${output_dir}"
+
+    local stage=""
+    stage="$(mktemp -d "${TMPDIR:-/tmp}/aditurbo-package.XXXXXX")"
+    trap 'rm -rf "${stage:-}"' RETURN
+
+    mkdir -p "${stage}/${name}/bin"
+    mkdir -p "${stage}/${name}/scripts"
+    mkdir -p "${stage}/${name}/gguf-py"
+
+    cp "${ROOT_DIR}/scripts/aditurbo" "${stage}/${name}/bin/aditurbo"
+    cp "${ROOT_DIR}/scripts/aditurbo" "${stage}/${name}/bin/adi-ccp"
+    chmod +x "${stage}/${name}/bin/aditurbo"
+    chmod +x "${stage}/${name}/bin/adi-ccp"
+    cp "${ROOT_DIR}/scripts/aditurbo-ui.html" "${stage}/${name}/scripts/"
+    cp "${BIN_DIR}/llama-cli" "${stage}/${name}/bin/"
+    cp "${BIN_DIR}/llama-server" "${stage}/${name}/bin/"
+    cp "${BIN_DIR}/llama-quantize" "${stage}/${name}/bin/"
+    cp "${BIN_DIR}/llama-bench" "${stage}/${name}/bin/"
+    cp "${BIN_DIR}/llama-perplexity" "${stage}/${name}/bin/"
+    cp "${BIN_DIR}/llama-imatrix" "${stage}/${name}/bin/"
+    # bundle the upstream MIT license — required for redistribution
+    cp "${ROOT_DIR}/LICENSE" "${stage}/${name}/LICENSE"
+    cp "${ROOT_DIR}/convert_hf_to_gguf.py" "${stage}/${name}/"
+    cp "${ROOT_DIR}/convert_hf_to_gguf.py" "${stage}/${name}/scripts/"
+    cp -R "${ROOT_DIR}/gguf-py/gguf" "${stage}/${name}/gguf-py/"
+
+    cat > "${stage}/${name}/README.txt" <<EOF
+AdiTurbo CLI Package
+
+Install:
+  1) Copy this folder wherever you want
+  2) Add "<package>/bin" to PATH
+  3) Run: aditurbo help  (or adi-ccp help)
+
+Included binaries:
+  llama-cli, llama-server, llama-quantize, llama-bench, llama-perplexity, llama-imatrix
+
+License: MIT (see LICENSE — based on llama.cpp, github.com/ggerganov/llama.cpp)
+
+Runtime default:
+  aditurbo run --model <model.gguf>
+EOF
+
+    local tarball="${output_dir}/${name}.tar.gz"
+    tar -C "${stage}" -czf "${tarball}" "${name}"
+    local sha
+    sha="$(shasum -a 256 "${tarball}" | awk '{print $1}')"
+    log "package created: ${tarball}"
+    log "sha256: ${sha}"
+}
+
+main() {
+    local cmd="${1:-help}"
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+
+    case "${cmd}" in
+        install) run_install "$@" ;;
+        info) run_info "$@" ;;
+        convert) run_convert "$@" ;;
+        run) run_run "$@" ;;
+        ui) run_ui "$@" ;;
+        bench) run_bench "$@" ;;
+        test) run_test "$@" ;;
+        package) run_package "$@" ;;
+        help|-h|--help) print_main_help ;;
+        version|-v|--version)
+            local git_rev=""
+            git_rev="$(git -C "${ROOT_DIR}" rev-parse --short HEAD 2>/dev/null || true)"
+            printf 'aditurbo %s%s\n' "${ADITURBO_VERSION}" "${git_rev:+ (${git_rev})}"
+            ;;
+        *) die "unknown command: ${cmd} (run: aditurbo help)" ;;
+    esac
+}
+
+main "$@"

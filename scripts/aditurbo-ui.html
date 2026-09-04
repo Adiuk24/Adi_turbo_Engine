@@ -1,0 +1,1074 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AdiTurbo UI</title>
+  <style>
+    :root {
+      --bg: #090909;
+      --window: #f3f3f3;
+      --panel: #ececec;
+      --border: #dedede;
+      --text: #141414;
+      --muted: #7a7a7a;
+      --primary: #2f6ee5;
+      --primary-text: #ffffff;
+      --bubble-user: #2f6ee5;
+      --bubble-assistant: #ffffff;
+      --shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+    }
+
+    .window {
+      width: min(1320px, 96vw);
+      height: min(860px, 94vh);
+      background: var(--window);
+      border: 1px solid #d0d0d0;
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      display: grid;
+      grid-template-rows: 48px 1fr;
+    }
+
+    .titlebar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      background: #e9e9e9;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .traffic {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+
+    .dot.red { background: #ff5f57; }
+    .dot.yellow { background: #febc2e; }
+    .dot.green { background: #28c840; }
+
+    .bar-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .icon-btn {
+      width: 28px;
+      height: 28px;
+      border: 1px solid #d5d5d5;
+      background: #f6f6f6;
+      color: #3b3b3b;
+      border-radius: 8px;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+      font-size: 13px;
+    }
+
+    .body {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      min-height: 0;
+    }
+
+    .window.sidebar-hidden .body {
+      grid-template-columns: 0 1fr;
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--border);
+      padding: 12px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: #f1f1f1;
+    }
+
+    .window.sidebar-hidden .sidebar {
+      padding: 0;
+      border-right: 0;
+    }
+
+    .new-chat {
+      border: 1px solid #dadada;
+      background: #e9e9e9;
+      border-radius: 9px;
+      padding: 10px 12px;
+      font-weight: 600;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .section-label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+      margin-top: 4px;
+    }
+
+    .chat-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      overflow-y: auto;
+      min-height: 120px;
+      max-height: 220px;
+    }
+
+    .chat-item {
+      border-radius: 8px;
+      border: 1px solid transparent;
+      padding: 9px 10px;
+      font-size: 14px;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #2a2a2a;
+    }
+
+    .chat-item:hover {
+      background: #ededed;
+    }
+
+    .chat-item.active {
+      background: #e3e9ff;
+      border-color: #c9d6ff;
+    }
+
+    .main {
+      display: grid;
+      grid-template-rows: 56px 1fr auto;
+      min-width: 0;
+      min-height: 0;
+      background: #f7f7f7;
+    }
+
+    .top {
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      background: #f2f2f2;
+    }
+
+    .top-left {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .title {
+      font-weight: 700;
+      font-size: 15px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 700px;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .status {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .content {
+      min-height: 0;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .empty {
+      margin: auto;
+      text-align: center;
+      color: #a0a0a0;
+      display: grid;
+      gap: 10px;
+      place-items: center;
+    }
+
+    .llama {
+      width: 52px;
+      height: 52px;
+    }
+
+    .msg {
+      max-width: min(880px, 92%);
+      padding: 12px 14px;
+      border-radius: 12px;
+      white-space: pre-wrap;
+      line-height: 1.45;
+      font-size: 14px;
+      border: 1px solid #dddddd;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+
+    .msg.assistant {
+      background: var(--bubble-assistant);
+      color: #1a1a1a;
+    }
+
+    .msg.user {
+      margin-left: auto;
+      background: var(--bubble-user);
+      color: var(--primary-text);
+      border-color: transparent;
+    }
+
+    .composer {
+      border-top: 1px solid var(--border);
+      padding: 12px;
+      background: #f2f2f2;
+      display: grid;
+      gap: 8px;
+    }
+
+    .compose-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 52px;
+      max-height: 180px;
+      resize: vertical;
+      border-radius: 12px;
+      border: 1px solid #d8d8d8;
+      background: #ffffff;
+      padding: 14px;
+      font-size: 15px;
+      font-family: inherit;
+      color: #1a1a1a;
+    }
+
+    .send-wrap {
+      display: grid;
+      gap: 8px;
+      justify-items: end;
+    }
+
+    .send {
+      border: 0;
+      background: var(--primary);
+      color: #fff;
+      font-weight: 700;
+      border-radius: 999px;
+      padding: 10px 14px;
+      min-width: 78px;
+      cursor: pointer;
+    }
+
+    .send:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .controls input,
+    .controls select {
+      border: 1px solid #dadada;
+      background: #fff;
+      color: #1a1a1a;
+      border-radius: 8px;
+      padding: 7px 9px;
+      font-size: 12px;
+    }
+
+    .controls label {
+      font-size: 12px;
+      color: #666;
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .settings {
+      display: none;
+      border: 1px solid #dddddd;
+      border-radius: 10px;
+      background: #fff;
+      padding: 10px;
+      gap: 8px;
+      grid-template-columns: repeat(3, minmax(140px, 1fr));
+    }
+
+    .settings.open {
+      display: grid;
+    }
+
+    .convert-card {
+      margin-top: 8px;
+      border: 1px solid #dddddd;
+      background: #f8f8f8;
+      border-radius: 10px;
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .convert-card h4 {
+      margin: 0;
+      font-size: 13px;
+      color: #222;
+    }
+
+    .convert-card label {
+      display: grid;
+      gap: 4px;
+      font-size: 11px;
+      color: #666;
+    }
+
+    .convert-card input,
+    .convert-card select,
+    .convert-card textarea {
+      width: 100%;
+      border: 1px solid #d6d6d6;
+      border-radius: 8px;
+      background: #fff;
+      color: #111;
+      font-size: 12px;
+      padding: 7px 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .convert-card textarea {
+      min-height: 92px;
+      resize: vertical;
+      white-space: pre;
+    }
+
+    .convert-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .small-btn {
+      border: 1px solid #d4d4d4;
+      background: #efefef;
+      color: #222;
+      border-radius: 7px;
+      padding: 7px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      flex: 1;
+    }
+
+    @media (max-width: 980px) {
+      .window { width: 98vw; height: 96vh; }
+      .body { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .window.sidebar-hidden .body { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="window" id="window">
+    <div class="titlebar">
+      <div class="traffic">
+        <span class="dot red"></span>
+        <span class="dot yellow"></span>
+        <span class="dot green"></span>
+      </div>
+      <div class="bar-actions">
+        <button class="icon-btn" id="toggleSidebarBtn" title="Toggle chats">| |</button>
+        <button class="icon-btn" id="toggleSettingsBtn" title="Settings">..</button>
+      </div>
+    </div>
+
+    <div class="body">
+      <aside class="sidebar" id="sidebar">
+        <button class="new-chat" id="newChatBtn">+ New Chat</button>
+        <div class="section-label">Older</div>
+        <ul class="chat-list" id="chatList"></ul>
+        <div class="convert-card">
+          <h4>AdiTurbo Convert</h4>
+          <label>Source Mode
+            <select id="convertSourceMode">
+              <option value="f16">F16/BF16 GGUF</option>
+              <option value="hf-dir">HF local dir</option>
+              <option value="hf-repo">HF repo id</option>
+            </select>
+          </label>
+          <label>Source
+            <input id="convertSourceValue" placeholder="/path/model-F16.gguf or org/model" />
+          </label>
+          <label>Quant Type
+            <select id="convertType">
+              <option value="TQ3_0">TQ3_0</option>
+              <option value="TQ4_0">TQ4_0</option>
+              <option value="TQ2_0">TQ2_0</option>
+              <option value="TQ1_0">TQ1_0</option>
+            </select>
+          </label>
+          <label>Output GGUF
+            <input id="convertOut" placeholder="/path/model-TQ3_0.gguf" />
+          </label>
+          <label>Imatrix (optional)
+            <input id="convertImatrix" placeholder="/path/model.imatrix" />
+          </label>
+          <label>Calibration (optional)
+            <input id="convertCalibration" placeholder="/path/wiki.test.raw" />
+          </label>
+          <div class="convert-actions">
+            <button class="small-btn" id="buildConvertCmdBtn">Build Cmd</button>
+            <button class="small-btn" id="copyConvertCmdBtn">Copy</button>
+            <button class="small-btn" id="runConvertBtn">Run Convert</button>
+          </div>
+          <textarea id="convertCmdPreview" readonly></textarea>
+          <textarea id="convertLog" readonly placeholder="Conversion logs will appear here"></textarea>
+        </div>
+      </aside>
+
+      <section class="main">
+        <header class="top">
+          <div class="top-left">
+            <div class="title" id="title">AdiTurbo Chat</div>
+            <div class="subtitle" id="subtitle">Weights + KV + Runtime</div>
+          </div>
+          <div class="status" id="status">Ready</div>
+        </header>
+
+        <div class="content" id="content"></div>
+
+        <footer class="composer">
+          <div class="settings" id="settings">
+            <label>API Base <input id="apiBase" /></label>
+            <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" /></label>
+            <label>Top P <input id="topP" type="number" min="0" max="1" step="0.05" /></label>
+          </div>
+
+          <div class="compose-row">
+            <textarea id="prompt" placeholder="Send a message"></textarea>
+            <div class="send-wrap">
+              <button class="send" id="sendBtn">Send</button>
+            </div>
+          </div>
+
+          <div class="controls">
+            <label>Model
+              <select id="modelSelect"></select>
+            </label>
+            <label>Max Tokens
+              <input id="maxTokens" type="number" min="16" max="4096" step="16" />
+            </label>
+            <button class="icon-btn" id="refreshBtn" title="Refresh models">R</button>
+            <button class="icon-btn" id="clearBtn" title="Clear current chat">C</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const STORAGE_KEY = "aditurbo_ui_v3";
+
+    const qs = new URLSearchParams(window.location.search);
+    const presetApi = qs.get("api") || "http://127.0.0.1:11434";
+    const presetModel = qs.get("model") || "";
+    const apiToken = qs.get("token") || "";
+
+    const el = {
+      window: document.getElementById("window"),
+      chatList: document.getElementById("chatList"),
+      content: document.getElementById("content"),
+      prompt: document.getElementById("prompt"),
+      sendBtn: document.getElementById("sendBtn"),
+      status: document.getElementById("status"),
+      title: document.getElementById("title"),
+      subtitle: document.getElementById("subtitle"),
+      newChatBtn: document.getElementById("newChatBtn"),
+      clearBtn: document.getElementById("clearBtn"),
+      refreshBtn: document.getElementById("refreshBtn"),
+      toggleSidebarBtn: document.getElementById("toggleSidebarBtn"),
+      toggleSettingsBtn: document.getElementById("toggleSettingsBtn"),
+      settings: document.getElementById("settings"),
+      apiBase: document.getElementById("apiBase"),
+      modelSelect: document.getElementById("modelSelect"),
+      temperature: document.getElementById("temperature"),
+      topP: document.getElementById("topP"),
+      maxTokens: document.getElementById("maxTokens"),
+      convertSourceMode: document.getElementById("convertSourceMode"),
+      convertSourceValue: document.getElementById("convertSourceValue"),
+      convertType: document.getElementById("convertType"),
+      convertOut: document.getElementById("convertOut"),
+      convertImatrix: document.getElementById("convertImatrix"),
+      convertCalibration: document.getElementById("convertCalibration"),
+      buildConvertCmdBtn: document.getElementById("buildConvertCmdBtn"),
+      copyConvertCmdBtn: document.getElementById("copyConvertCmdBtn"),
+      runConvertBtn: document.getElementById("runConvertBtn"),
+      convertCmdPreview: document.getElementById("convertCmdPreview"),
+      convertLog: document.getElementById("convertLog")
+    };
+
+    let busy = false;
+
+    const state = loadState();
+    state.apiBase = presetApi || state.apiBase;
+    if (presetModel) state.selectedModel = presetModel;
+
+    syncStateToInputs();
+    ensureConversation();
+    renderAll();
+    loadModels();
+
+    function now() { return Date.now(); }
+    function uid() { return `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`; }
+
+    function defaultState() {
+      return {
+        apiBase: "http://127.0.0.1:11434",
+        selectedModel: "",
+        temperature: 0.7,
+        topP: 0.9,
+        maxTokens: 512,
+        convertSourceMode: "f16",
+        convertSourceValue: "",
+        convertType: "TQ3_0",
+        convertOut: "",
+        convertImatrix: "",
+        convertCalibration: "",
+        sidebarOpen: true,
+        settingsOpen: false,
+        conversations: [],
+        currentId: ""
+      };
+    }
+
+    function loadState() {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+        return Object.assign(defaultState(), parsed || {});
+      } catch {
+        return defaultState();
+      }
+    }
+
+    function saveState() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
+
+    function sanitizeAssistant(text) {
+      return String(text || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+    }
+
+    function buildChatMessages(conv) {
+      const system = {
+        role: "system",
+        content: "You are AdiTurbo Assistant. Reply directly in plain text. Do not output prompt templates, section headers like '### Instruction', or separators like '---'."
+      };
+      const history = conv.messages
+        .slice(0, conv.messages.length - 1)
+        .map(m => ({ role: m.role, content: m.content }));
+      return [system, ...history];
+    }
+
+    function syncStateToInputs() {
+      el.apiBase.value = state.apiBase;
+      el.temperature.value = String(state.temperature);
+      el.topP.value = String(state.topP);
+      el.maxTokens.value = String(state.maxTokens);
+      el.convertSourceMode.value = state.convertSourceMode || "f16";
+      el.convertSourceValue.value = state.convertSourceValue || "";
+      el.convertType.value = state.convertType || "TQ3_0";
+      el.convertOut.value = state.convertOut || "";
+      el.convertImatrix.value = state.convertImatrix || "";
+      el.convertCalibration.value = state.convertCalibration || "";
+      el.settings.classList.toggle("open", !!state.settingsOpen);
+      el.window.classList.toggle("sidebar-hidden", !state.sidebarOpen);
+    }
+
+    function setStatus(text) {
+      el.status.textContent = text;
+    }
+
+    function sortedConversations() {
+      return [...state.conversations].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    }
+
+    function getCurrentConversation() {
+      return state.conversations.find(c => c.id === state.currentId) || null;
+    }
+
+    function ensureConversation() {
+      if (!state.conversations.length) {
+        const id = uid();
+        state.currentId = id;
+        state.conversations.push({
+          id,
+          title: "New Chat",
+          model: state.selectedModel || "",
+          createdAt: now(),
+          updatedAt: now(),
+          messages: []
+        });
+      } else if (!getCurrentConversation()) {
+        state.currentId = sortedConversations()[0].id;
+      }
+      saveState();
+    }
+
+    function currentModel() {
+      const conv = getCurrentConversation();
+      return (conv && conv.model) || state.selectedModel || "";
+    }
+
+    function renderConversations() {
+      const list = sortedConversations();
+      el.chatList.innerHTML = "";
+      for (const conv of list) {
+        const li = document.createElement("li");
+        li.className = "chat-item" + (conv.id === state.currentId ? " active" : "");
+        li.textContent = conv.title || "New Chat";
+        li.title = conv.title || "New Chat";
+        li.onclick = () => {
+          state.currentId = conv.id;
+          saveState();
+          renderAll();
+        };
+        el.chatList.appendChild(li);
+      }
+    }
+
+    function renderContent() {
+      const conv = getCurrentConversation();
+      el.content.innerHTML = "";
+      if (!conv || !conv.messages.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.innerHTML = `
+          <svg class="llama" viewBox="0 0 64 64" fill="none" stroke="#111" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 28c-2 3-3 7-3 12v7c0 5 4 9 9 9h12c5 0 9-4 9-9v-7c0-5-1-9-3-12" />
+            <path d="M22 28l2-12c.4-2 3-3 4-1l4 7 4-7c1-2 3.6-1 4 1l2 12" />
+            <circle cx="27" cy="38" r="1.7" fill="#111" />
+            <circle cx="37" cy="38" r="1.7" fill="#111" />
+            <path d="M27 45c2 2 8 2 10 0" />
+          </svg>
+          <div>Start a new AdiTurbo chat</div>
+        `;
+        el.content.appendChild(empty);
+        return;
+      }
+
+      for (const msg of conv.messages) {
+        const div = document.createElement("div");
+        div.className = "msg " + msg.role;
+        div.textContent = msg.content || "";
+        el.content.appendChild(div);
+      }
+      el.content.scrollTop = el.content.scrollHeight;
+    }
+
+    function renderTop() {
+      const conv = getCurrentConversation();
+      const model = currentModel();
+      el.title.textContent = conv ? `AdiTurbo Chat - ${conv.title}` : "AdiTurbo Chat";
+      el.subtitle.textContent = model ? `Model: ${model}` : "Weights + KV + Runtime";
+    }
+
+    function renderModelSelect(models) {
+      const old = state.selectedModel;
+      el.modelSelect.innerHTML = "";
+      (models || []).forEach(id => {
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = id;
+        el.modelSelect.appendChild(opt);
+      });
+      const want = currentModel() || old || presetModel;
+      if (want && (models || []).includes(want)) {
+        el.modelSelect.value = want;
+      } else if ((models || []).length) {
+        el.modelSelect.value = models[0];
+      }
+      state.selectedModel = el.modelSelect.value || state.selectedModel || "";
+      const conv = getCurrentConversation();
+      if (conv && !conv.model) conv.model = state.selectedModel;
+      saveState();
+    }
+
+    function renderAll() {
+      syncStateToInputs();
+      renderConversations();
+      renderTop();
+      renderContent();
+    }
+
+    function updateTitleFromFirstPrompt(conv) {
+      const firstUser = conv.messages.find(m => m.role === "user");
+      if (!firstUser) return;
+      const clean = firstUser.content.replace(/\s+/g, " ").trim();
+      conv.title = clean.length > 42 ? clean.slice(0, 42) + "..." : clean;
+    }
+
+    async function loadModels() {
+      const base = (el.apiBase.value || "").replace(/\/+$/, "");
+      state.apiBase = base || "http://127.0.0.1:11434";
+      saveState();
+      setStatus("Loading models...");
+      try {
+        const r = await fetch(`${state.apiBase}/v1/models`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const payload = await r.json();
+        const models = (payload.data || []).map(x => x.id).sort();
+        renderModelSelect(models);
+        setStatus(models.length ? "Ready" : "No models found");
+        renderTop();
+      } catch (err) {
+        setStatus(`Model load failed: ${err.message}`);
+      }
+    }
+
+    function shellQuote(v) {
+      const s = String(v || "");
+      if (!s) return "''";
+      return `'${s.replace(/'/g, `'\"'\"'`)}'`;
+    }
+
+    function buildConvertCommand() {
+      const mode = el.convertSourceMode.value || "f16";
+      const source = (el.convertSourceValue.value || "").trim();
+      const type = (el.convertType.value || "TQ3_0").trim();
+      const out = (el.convertOut.value || "").trim();
+      const imatrix = (el.convertImatrix.value || "").trim();
+      const calibration = (el.convertCalibration.value || "").trim();
+
+      const parts = ["aditurbo", "convert"];
+      if (mode === "f16") parts.push("--f16", shellQuote(source));
+      if (mode === "hf-dir") parts.push("--hf-dir", shellQuote(source));
+      if (mode === "hf-repo") parts.push("--hf-repo", shellQuote(source));
+      if (out) parts.push("--out", shellQuote(out));
+      if (type) parts.push("--type", type);
+      if (imatrix) parts.push("--imatrix", shellQuote(imatrix));
+      if (calibration) parts.push("--calibration", shellQuote(calibration));
+      return parts.join(" ");
+    }
+
+    function refreshConvertPreview() {
+      state.convertSourceMode = el.convertSourceMode.value;
+      state.convertSourceValue = el.convertSourceValue.value.trim();
+      state.convertType = el.convertType.value;
+      state.convertOut = el.convertOut.value.trim();
+      state.convertImatrix = el.convertImatrix.value.trim();
+      state.convertCalibration = el.convertCalibration.value.trim();
+      saveState();
+      el.convertCmdPreview.value = buildConvertCommand();
+    }
+
+    async function runConvert() {
+      refreshConvertPreview();
+      const sourceMode = el.convertSourceMode.value;
+      const sourceValue = el.convertSourceValue.value.trim();
+      const type = el.convertType.value;
+      const out = el.convertOut.value.trim();
+      const imatrix = el.convertImatrix.value.trim();
+      const calibration = el.convertCalibration.value.trim();
+
+      if (!sourceValue || !out) {
+        setStatus("Source and output are required");
+        return;
+      }
+
+      const payload = {
+        source_mode: sourceMode,
+        source: sourceValue,
+        type,
+        out,
+        imatrix,
+        calibration
+      };
+
+      setStatus("Running convert...");
+      el.runConvertBtn.disabled = true;
+      el.runConvertBtn.textContent = "Running...";
+      el.convertLog.value = "Submitting conversion job...\n";
+      try {
+        const res = await fetch(`/api/convert`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-AdiTurbo-Token": apiToken },
+          body: JSON.stringify(payload)
+        });
+        const json = await res.json();
+        const lines = [];
+        lines.push(`exit_code: ${json.exit_code}`);
+        lines.push(`ok: ${json.ok}`);
+        lines.push("");
+        lines.push(`command: ${Array.isArray(json.command) ? json.command.join(" ") : ""}`);
+        if (json.stdout) {
+          lines.push("");
+          lines.push("--- stdout ---");
+          lines.push(String(json.stdout).trim());
+        }
+        if (json.stderr) {
+          lines.push("");
+          lines.push("--- stderr ---");
+          lines.push(String(json.stderr).trim());
+        }
+        el.convertLog.value = lines.join("\n") + "\n";
+        setStatus(json.ok ? "Convert complete" : "Convert failed");
+      } catch (err) {
+        el.convertLog.value += `\nError: ${err.message}\n`;
+        setStatus("Convert error");
+      } finally {
+        el.runConvertBtn.disabled = false;
+        el.runConvertBtn.textContent = "Run Convert";
+      }
+    }
+
+    function createNewConversation() {
+      const id = uid();
+      state.conversations.unshift({
+        id,
+        title: "New Chat",
+        model: state.selectedModel || "",
+        createdAt: now(),
+        updatedAt: now(),
+        messages: []
+      });
+      state.currentId = id;
+      saveState();
+      renderAll();
+      el.prompt.focus();
+    }
+
+    function clearCurrentChat() {
+      const conv = getCurrentConversation();
+      if (!conv) return;
+      conv.messages = [];
+      conv.title = "New Chat";
+      conv.updatedAt = now();
+      saveState();
+      renderAll();
+      setStatus("Chat cleared");
+    }
+
+    async function streamChatCompletion(payload, onDelta) {
+      const res = await fetch(`${state.apiBase}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`HTTP ${res.status} ${txt.slice(0, 120)}`);
+      }
+
+      const isSse = (res.headers.get("content-type") || "").includes("text/event-stream");
+      if (!isSse || !res.body) {
+        const json = await res.json();
+        const content = json?.choices?.[0]?.message?.content || "";
+        onDelta(content, true);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buf = "";
+      let finalText = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const data = t.slice(5).trim();
+          if (data === "[DONE]") {
+            onDelta(finalText, true);
+            return;
+          }
+          try {
+            const json = JSON.parse(data);
+            const piece = json?.choices?.[0]?.delta?.content || "";
+            if (piece) {
+              finalText += piece;
+              onDelta(finalText, false);
+            }
+          } catch (_) {
+          }
+        }
+      }
+      onDelta(finalText, true);
+    }
+
+    async function sendMessage() {
+      if (busy) return;
+      const text = el.prompt.value.trim();
+      if (!text) return;
+      const conv = getCurrentConversation();
+      if (!conv) return;
+
+      let model = el.modelSelect.value || state.selectedModel || conv.model;
+      if (!model) {
+        setStatus("Pick a model first");
+        return;
+      }
+      conv.model = model;
+      state.selectedModel = model;
+      saveState();
+
+      conv.messages.push({ role: "user", content: text });
+      conv.messages.push({ role: "assistant", content: "" });
+      conv.updatedAt = now();
+      updateTitleFromFirstPrompt(conv);
+      el.prompt.value = "";
+      renderAll();
+      setStatus("Generating...");
+      busy = true;
+      el.sendBtn.disabled = true;
+      el.sendBtn.textContent = "Loading...";
+
+      try {
+        const payload = {
+          model,
+          stream: true,
+          temperature: Number(el.temperature.value || state.temperature || 0.7),
+          top_p: Number(el.topP.value || state.topP || 0.9),
+          max_tokens: Number(el.maxTokens.value || state.maxTokens || 512),
+          stop: [
+            "\n### Instruction",
+            "\n---\n",
+            "<|im_end|>",
+            "<|end|>"
+          ],
+          messages: buildChatMessages(conv)
+        };
+
+        await streamChatCompletion(payload, (accumulated, done) => {
+          conv.messages[conv.messages.length - 1].content = sanitizeAssistant(accumulated);
+          if (done) conv.updatedAt = now();
+          saveState();
+          renderContent();
+        });
+        setStatus("Ready");
+      } catch (err) {
+        conv.messages[conv.messages.length - 1].content = `Error: ${err.message}`;
+        saveState();
+        renderContent();
+        setStatus("Error");
+      } finally {
+        busy = false;
+        el.sendBtn.disabled = false;
+        el.sendBtn.textContent = "Send";
+      }
+    }
+
+    el.newChatBtn.addEventListener("click", createNewConversation);
+    el.clearBtn.addEventListener("click", clearCurrentChat);
+    el.refreshBtn.addEventListener("click", loadModels);
+    el.sendBtn.addEventListener("click", sendMessage);
+    el.prompt.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+    el.toggleSidebarBtn.addEventListener("click", () => {
+      state.sidebarOpen = !state.sidebarOpen;
+      saveState();
+      renderAll();
+    });
+    el.toggleSettingsBtn.addEventListener("click", () => {
+      state.settingsOpen = !state.settingsOpen;
+      saveState();
+      renderAll();
+    });
+
+    el.apiBase.addEventListener("change", () => {
+      state.apiBase = el.apiBase.value.trim() || "http://127.0.0.1:11434";
+      saveState();
+      loadModels();
+    });
+    el.temperature.addEventListener("change", () => {
+      state.temperature = Number(el.temperature.value || 0.7);
+      saveState();
+    });
+    el.topP.addEventListener("change", () => {
+      state.topP = Number(el.topP.value || 0.9);
+      saveState();
+    });
+    el.maxTokens.addEventListener("change", () => {
+      state.maxTokens = Number(el.maxTokens.value || 512);
+      saveState();
+    });
+    el.modelSelect.addEventListener("change", () => {
+      state.selectedModel = el.modelSelect.value;
+      const conv = getCurrentConversation();
+      if (conv) conv.model = state.selectedModel;
+      saveState();
+      renderTop();
+    });
+
+    el.buildConvertCmdBtn.addEventListener("click", refreshConvertPreview);
+    el.copyConvertCmdBtn.addEventListener("click", async () => {
+      refreshConvertPreview();
+      try {
+        await navigator.clipboard.writeText(el.convertCmdPreview.value || "");
+        setStatus("Convert command copied");
+      } catch (_) {
+        setStatus("Copy failed");
+      }
+    });
+    el.runConvertBtn.addEventListener("click", runConvert);
+
+    [
+      el.convertSourceMode,
+      el.convertSourceValue,
+      el.convertType,
+      el.convertOut,
+      el.convertImatrix,
+      el.convertCalibration
+    ].forEach(node => node.addEventListener("change", refreshConvertPreview));
+
+    refreshConvertPreview();
+  </script>
+</body>
+</html>
