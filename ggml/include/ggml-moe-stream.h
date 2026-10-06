@@ -25,6 +25,13 @@
 //                                fan-out on the single-group decode fast path (default off)
 //   GGML_MOE_STREAM_FETCH_THREADS=<n>  threads dedicated to the fetch fan-out under
 //                                HITFIRST; the rest compute hits concurrently (default 2)
+//   GGML_MOE_STREAM_RESIDENT_FIRST=1  on multi-group calls (prefill), process already-resident
+//                                experts first so later groups don't re-read from SSD experts
+//                                an earlier group evicted (default off, byte-identical output)
+//   GGML_MOE_STREAM_DECAY_EVERY=<n>  LFU hotness decay period in plan() calls (default 256)
+//   GGML_MOE_STREAM_DECAY_PCT=<p>    percent of use_count kept per decay, 0..100 (default 50).
+//                                Suggested experiment (oMLX, tuned on Qwen3.8-Flash traces):
+//                                EVERY=4 PCT=70. Eviction policy only -- never changes math.
 //   GGML_MOE_STREAM_PREFETCH=1   enable a background IO thread that speculatively
 //                                pre-reads likely-next experts into extra landing slots
 //                                during the idle bus time between fetch phases (default off,
@@ -124,6 +131,11 @@ GGML_API const char * ggml_moe_stream_slab(const struct ggml_tensor * t, int exp
 // for anything else. Same validity window as ggml_moe_stream_n_misses() /
 // ggml_moe_stream_slab(): after that plan()'s barrier, before the next plan().
 GGML_API bool ggml_moe_stream_expert_is_hit(const struct ggml_tensor * t, int expert_id);
+
+// Is `expert_id` currently resident in a slot (expert_to_slot >= 0)? Reads
+// residency, not the last plan()'s miss list. Only call when no thread can be
+// inside plan() for this tensor (GGML_MOE_STREAM_RESIDENT_FIRST barriers for it).
+GGML_API bool ggml_moe_stream_expert_is_resident(const struct ggml_tensor * t, int expert_id);
 
 #ifdef __cplusplus
 }

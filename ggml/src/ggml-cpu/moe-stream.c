@@ -1138,9 +1138,27 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         // early-hot expert squats in a slot forever even after routing drifts with the
         // topic. Halve all counts every 256 plan() calls (~256 decoded tokens per
         // tensor); recency (last_use) still breaks ties.
-        if ((e->plan_calls & 255) == 0) {
+        // GGML_MOE_STREAM_DECAY_EVERY=<n> (default 256) / _DECAY_PCT=<p> (default 50,
+        // percent of count kept). Defaults keep the original `& 255` / `>>= 1` path.
+        // ponytail: integer counts floor small values to 0 under aggressive decay;
+        // recency (last_use) still breaks ties. Upgrade path: fixed-point counts.
+        static int decay_every = -1, decay_pct = 50;
+        if (decay_every < 0) {
+            const char * ve = getenv("GGML_MOE_STREAM_DECAY_EVERY");
+            const char * vp = getenv("GGML_MOE_STREAM_DECAY_PCT");
+            int ev = ve ? atoi(ve) : 256;
+            int pc = vp ? atoi(vp) : 50;
+            decay_pct   = pc < 0 ? 0 : (pc > 100 ? 100 : pc);
+            decay_every = ev < 1 ? 1 : ev;
+        }
+        const bool dflt = decay_every == 256 && decay_pct == 50;
+        if (dflt ? (e->plan_calls & 255) == 0 : (e->plan_calls % (uint64_t) decay_every) == 0) {
             for (int i = 0; i < e->n_expert; i++) {
-                e->use_count[i] >>= 1;
+                if (dflt) {
+                    e->use_count[i] >>= 1;
+                } else {
+                    e->use_count[i] = e->use_count[i] * (uint64_t) decay_pct / 100;
+                }
             }
         }
     }
@@ -1426,4 +1444,12 @@ bool ggml_moe_stream_expert_is_hit(const struct ggml_tensor * t, int expert_id) 
         }
     }
     return true;
+}
+
+// GGML_MOE_STREAM_RESIDENT_FIRST support (ggml-cpu.c): is `expert_id` currently
+// resident in a slot? Unlike expert_is_hit this reads residency itself, not the
+// last plan()'s miss list. Caller must not race plan() (barrier in ggml-cpu.c).
+bool ggml_moe_stream_expert_is_resident(const struct ggml_tensor * t, int expert_id) {
+    struct moe_stream_entry * e = moe_stream_find_entry(t);
+    return e && expert_id >= 0 && expert_id < e->n_expert && e->expert_to_slot[expert_id] >= 0;
 }

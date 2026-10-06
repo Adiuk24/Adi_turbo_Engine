@@ -1766,6 +1766,34 @@ static void ggml_compute_forward_mul_mat_id(
         ggml_moe_stream_mark_chunked(src0);
     }
 
+    // GGML_MOE_STREAM_RESIDENT_FIRST=1: on multi-group calls (prefill), stable-
+    // partition active[] so currently-resident experts come first. Otherwise group
+    // 1's plan() can evict a resident expert a LATER group needs, re-reading it
+    // from SSD. Default off -> byte-identical. Single-group calls: no work, no barrier.
+    // ponytail: idea from oMLX moe_expert_offload.py _forward_expert_major (resident experts first).
+    static int resfirst_cached = -1;
+    if (resfirst_cached < 0) {
+        const char * v = getenv("GGML_MOE_STREAM_RESIDENT_FIRST");
+        resfirst_cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    if (resfirst_cached && n_groups > 1) {
+        int reordered[MOE_STREAM_MAX_EXPERTS]; // no VLA/malloc: MSVC (see `active` above)
+        int n_res = 0, n_non = 0;
+        for (int k = 0; k < n_active; ++k) {
+            if (ggml_moe_stream_expert_is_resident(src0, active[k])) {
+                reordered[n_res++] = active[k];
+            } else {
+                // compact non-resident in place at the front (n_non <= k)
+                active[n_non++] = active[k];
+            }
+        }
+        // active[0..n_non) holds non-resident in order; append after residents
+        memmove(active + n_res, active, n_non * sizeof(int));
+        memcpy(active, reordered, n_res * sizeof(int));
+        // every thread reads residency above; thread 0 mutates it in plan() below
+        ggml_barrier(params->threadpool);
+    }
+
     // GGML_MOE_STREAM_HITFIRST=1: the decode-phase stream is storage-bound
     // (fetch occupies most of the wall-clock), yet a chunk of the routed
     // experts are already resident (hits) and don't need to wait for the
