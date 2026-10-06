@@ -25,13 +25,14 @@
 //                                fan-out on the single-group decode fast path (default off)
 //   GGML_MOE_STREAM_FETCH_THREADS=<n>  threads dedicated to the fetch fan-out under
 //                                HITFIRST; the rest compute hits concurrently (default 2)
-//   GGML_MOE_STREAM_RESIDENT_FIRST=1  on multi-group calls (prefill), process already-resident
+//   GGML_MOE_STREAM_RESIDENT_FIRST=0  disable: on multi-group calls (prefill), process already-resident
 //                                experts first so later groups don't re-read from SSD experts
-//                                an earlier group evicted (default off, byte-identical output)
-//   GGML_MOE_STREAM_DECAY_EVERY=<n>  LFU hotness decay period in plan() calls (default 256)
-//   GGML_MOE_STREAM_DECAY_PCT=<p>    percent of use_count kept per decay, 0..100 (default 50).
-//                                Suggested experiment (oMLX, tuned on Qwen3.8-Flash traces):
-//                                EVERY=4 PCT=70. Eviction policy only -- never changes math.
+//                                an earlier group evicted (default ON since 10-07: 30B -15% SSD bytes,
+//                                -14% TTFT, byte-identical output)
+//   GGML_MOE_STREAM_DECAY_EVERY=<n>  LFU hotness decay period in plan() calls (default 4)
+//   GGML_MOE_STREAM_DECAY_PCT=<p>    percent of use_count kept per decay, 0..100 (default 70).
+//                                Default 4/70 = oMLX value tuned on Qwen3.8-Flash traces; old
+//                                behaviour = EVERY=256 PCT=50. Eviction policy only -- never changes math.
 //   GGML_MOE_STREAM_PREFETCH=1   enable a background IO thread that speculatively
 //                                pre-reads likely-next experts into extra landing slots
 //                                during the idle bus time between fetch phases (default off,

@@ -1766,15 +1766,15 @@ static void ggml_compute_forward_mul_mat_id(
         ggml_moe_stream_mark_chunked(src0);
     }
 
-    // GGML_MOE_STREAM_RESIDENT_FIRST=1: on multi-group calls (prefill), stable-
+    // GGML_MOE_STREAM_RESIDENT_FIRST (default ON, =0 disables): on multi-group calls (prefill), stable-
     // partition active[] so currently-resident experts come first. Otherwise group
     // 1's plan() can evict a resident expert a LATER group needs, re-reading it
-    // from SSD. Default off -> byte-identical. Single-group calls: no work, no barrier.
+    // from SSD. Output is byte-identical either way. Single-group calls: no work, no barrier.
     // ponytail: idea from oMLX moe_expert_offload.py _forward_expert_major (resident experts first).
     static int resfirst_cached = -1;
     if (resfirst_cached < 0) {
         const char * v = getenv("GGML_MOE_STREAM_RESIDENT_FIRST");
-        resfirst_cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
+        resfirst_cached = (v && strcmp(v, "0") == 0) ? 0 : 1; // default ON
     }
     if (resfirst_cached && n_groups > 1) {
         int reordered[MOE_STREAM_MAX_EXPERTS]; // no VLA/malloc: MSVC (see `active` above)

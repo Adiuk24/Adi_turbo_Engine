@@ -1138,16 +1138,16 @@ void ggml_moe_stream_plan(const struct ggml_tensor * t, const int64_t * row_coun
         // early-hot expert squats in a slot forever even after routing drifts with the
         // topic. Halve all counts every 256 plan() calls (~256 decoded tokens per
         // tensor); recency (last_use) still breaks ties.
-        // GGML_MOE_STREAM_DECAY_EVERY=<n> (default 256) / _DECAY_PCT=<p> (default 50,
-        // percent of count kept). Defaults keep the original `& 255` / `>>= 1` path.
+        // GGML_MOE_STREAM_DECAY_EVERY=<n> (default 4) / _DECAY_PCT=<p> (default 70,
+        // percent of count kept). EVERY=256 PCT=50 (old default) keeps the original `& 255` / `>>= 1` path.
         // ponytail: integer counts floor small values to 0 under aggressive decay;
         // recency (last_use) still breaks ties. Upgrade path: fixed-point counts.
         static int decay_every = -1, decay_pct = 50;
         if (decay_every < 0) {
             const char * ve = getenv("GGML_MOE_STREAM_DECAY_EVERY");
             const char * vp = getenv("GGML_MOE_STREAM_DECAY_PCT");
-            int ev = ve ? atoi(ve) : 256;
-            int pc = vp ? atoi(vp) : 50;
+            int ev = ve ? atoi(ve) : 4;   // oMLX Flash-tuned default (10-07)
+            int pc = vp ? atoi(vp) : 70;
             decay_pct   = pc < 0 ? 0 : (pc > 100 ? 100 : pc);
             decay_every = ev < 1 ? 1 : ev;
         }
